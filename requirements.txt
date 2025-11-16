@@ -1,0 +1,15 @@
+ultralytics
+opencv-python
+numpy
+pillow
+
+# Streamlit and Visualization
+streamlit
+pandas
+plotly
+
+# Optional (for GPS metadata)
+pyexiftool
+
+# Utilities
+python-dotenv

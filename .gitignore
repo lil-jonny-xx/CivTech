@@ -1,0 +1,80 @@
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# ML Models & Runs
+models/
+runs/
+*.pt
+
+# Executables
+*.exe
+
+# Specific files/folders to ignore
+exiftool_files/
+exiftool.exe
+ffprobe.exe
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# VS Code settings
+.vscode/
+
+# Environment variables (if you have one)
+.env
+
+# LaTeX temporary files
+*.aux
+*.log
+*.out
+# Datasets and large files
+data/
+models/*.pt
+results/
+
+# Virtual environments
+venv/
+env/
+
+# System files
+.DS_Store
+Thumbs.db
+# Ignore model weights and datasets
+*.pt
+*.pth
+datasets/
+outputs/
+*.mp4
+__pycache__/
+# Ignore model weights and large files
+models/*.pt
+models/*.onnx
+models/*.tflite
+models/*.engine
+
+# Ignore datasets and raw data
+data/*.zip
+data/*.tar
+data/images/
+data/labels/
+data/cache/
+data/*.json
+
+# Ignore system or IDE files
+.vscode/
+__pycache__/
+*.log
+*.tmp
+.DS_Store
+
+# Ignore notebooks checkpoints
+.ipynb_checkpoints/
+
+# Large video files
+data/inputs/*.mp4
+data/inputs/*.MP4
