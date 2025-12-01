@@ -1,2 +1,2 @@
 # CivTech
-ML Project for detecting Faulty Roads
+ML Project for detecting Faulty Roads (updated)
