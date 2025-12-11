@@ -18,7 +18,7 @@ Streamlit dashboard for visualization
 This project was built by:
 
 Jonathan V Paul
-Ronak Barwar
+  Ronak Barwar
 
 
 Core Features
