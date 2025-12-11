@@ -1,14 +1,10 @@
-<<<<<<< HEAD
 # Python virtual environment
 venv/
 
-=======
->>>>>>> 42f8a934a6951e1f418f11fe9afbf96447db9546
 # Python cache
 __pycache__/
 *.pyc
 
-<<<<<<< HEAD
 # ML Models & Runs
 models/
 runs/
@@ -36,8 +32,6 @@ Thumbs.db
 *.aux
 *.log
 *.out
-=======
->>>>>>> 42f8a934a6951e1f418f11fe9afbf96447db9546
 # Datasets and large files
 data/
 models/*.pt
@@ -80,10 +74,7 @@ __pycache__/
 
 # Ignore notebooks checkpoints
 .ipynb_checkpoints/
-<<<<<<< HEAD
 
 # Large video files
 data/inputs/*.mp4
 data/inputs/*.MP4
-=======
->>>>>>> 42f8a934a6951e1f418f11fe9afbf96447db9546

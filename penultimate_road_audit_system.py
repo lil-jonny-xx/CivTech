@@ -1,1071 +1,1095 @@
 """
-ULTIMATE Road Safety Audit System V9 - ENHANCED
+penultimate_road_audit_system.py
 
-FIXES APPLIED (V9.9.2):
-- FIXED: Increased cooldown period to 10 seconds to stop repetitions.
-- ADDED: "Strike System" for pavement/marking deterioration.
-- ADDED: "Guardrail Filter" to stop 'bench' false positives.
-- ADDED: Bounding boxes are now drawn on comparison images.
-- ADDED: 'VRUs' (person, bicycle, motorcycle) tracking.
-- ADDED: 'Road Furniture' (bench, fire hydrant, parking meter) tracking.
-- ADDED: Separate tracking for "traffic_lights".
-- ADDED: Explicit check for CUDA GPU at startup.
-- FIXED: ExifTool executable path.
-- FIXED: Removed 'input()' prompt for automated pipeline.
-- REMOVED: All emojis from print statements.
+Final merged comparator engine (Option A features included).
+- Guardrail occlusion handling (vegetation mask)
+- Temporal deduplication / cooldown
+- Segmentation auto-download attempt (placeholder URL)
+- FFmpeg/OpenCV frame extraction fallback
+- ORB visual sync
+- GISContextEngine + RootCauseAnalyzer
+- Marking analysis (segmentation preferred, OpenCV fallback)
+- PCI calculation, comparison, comparison image saving
+- Pipeline logs & suppressed events collected in report
 
-Save as: penultimate_road_audit_system.py
+Save in project root and ensure models/ and results/ exist.
 """
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
 from pathlib import Path
-import json
 from datetime import datetime
 import sys
 import re
-import gc
-import subprocess
-import torch
 import os
-from math import radians, sin, cos, sqrt, atan2
+import subprocess
+from math import sqrt
+from tqdm import tqdm
+import torch
+import json
 
-# --- EXIFTOOL FIX 1: Hard-code the path ---
-EXIFTOOL_PATH = r"D:\RoadSafetyAI\CivTech\exiftool.exe"
-
-# Optional ExifTool (graceful degradation if not available)
+# Optional dependencies
 try:
     import exiftool
     EXIFTOOL_AVAILABLE = True
-    
-    # --- EXIFTOOL FIX 2: THIS IS THE CRITICAL FIX ---
-    exiftool.executable = EXIFTOOL_PATH
-
-except ImportError:
+except Exception:
     EXIFTOOL_AVAILABLE = False
-    print(" [WARNING] 'PyExifTool' library not found. GPS metadata extraction will be limited.")
-except Exception as e:
-    EXIFTOOL_AVAILABLE = False
-    print(f" [WARNING] Error initializing ExifTool: {e}")
+
+try:
+    from geopy.geocoders import Nominatim
+    from geopy.exc import GeocoderTimedOut
+    GEOPY_AVAILABLE = True
+except Exception:
+    GEOPY_AVAILABLE = False
+    Nominatim = None
+    GeocoderTimedOut = Exception
+
+# ---------------------------------------------------------------------
+# PATHS / CONSTANTS
+# ---------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+MODELS_DIR = PROJECT_ROOT / "models"
+RESULTS_DIR = PROJECT_ROOT / "results"
+DATA_DIR = PROJECT_ROOT / "data"
+COMPARISON_DIR = RESULTS_DIR / "comparisons"
+
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+COMPARISON_DIR.mkdir(parents=True, exist_ok=True)
+
+BEST_MODEL_PATH = MODELS_DIR / "best.pt"
+BASE_MODEL_PATH = MODELS_DIR / "yolov8s.pt"
+
+SEG_MODEL_NAME = "road_markings_yolov8s-seg.pt"
+SEG_MODEL_PATH = MODELS_DIR / SEG_MODEL_NAME
+
+# FFmpeg path (relative to project root)
+FFMPEG_PATH = PROJECT_ROOT / "ffmpeg" / "bin" / "ffmpeg.exe"
+
+# Placeholder segmentation model download URL – replace with your hosted model
+SEG_MODEL_URL = "https://example.com/path/to/road_markings_yolov8s-seg.pt"
 
 
-class EnhancedRoadAuditSystem:
-    """
-    Enhanced system with all fixes
-    """
+# ---------------------------------------------------------------------
+# HELPER: ENSURE SEGMENTATION MODEL EXISTS
+# ---------------------------------------------------------------------
+def ensure_segmentation_model():
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    if SEG_MODEL_PATH.exists():
+        print(f"[SEG] Segmentation model found at {SEG_MODEL_PATH}")
+        return True
+
+    print(f"[SEG] Segmentation model missing. Attempting auto-download...")
+
+    try:
+        import requests
+    except Exception:
+        print("[SEG][WARN] 'requests' not installed. Please place segmentation model manually.")
+        return False
+
+    try:
+        r = requests.get(SEG_MODEL_URL, stream=True, timeout=30)
+        r.raise_for_status()
+        with open(SEG_MODEL_PATH, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        print(f"[SEG] Successfully downloaded segmentation model → {SEG_MODEL_PATH}")
+        return True
+    except Exception as e:
+        print(f"[SEG][ERROR] Auto-download failed: {e}")
+        print(f"[SEG] Please manually place the model at: {SEG_MODEL_PATH}")
+        return False
+
+
+# ---------------------------------------------------------------------
+# GIS ENGINE – simple offline + geopy fallback
+# ---------------------------------------------------------------------
+class GISContextEngine:
+    def __init__(self):
+        self.context_cache = {}
+        self.profile_cache = {}
+        self.geolocator = Nominatim(user_agent="road_audit_gis") if GEOPY_AVAILABLE else None
     
-    def __init__(self, config=None):
-        print("="*70)
-        print(" ENHANCED ROAD SAFETY AUDIT SYSTEM V9.9.2 (Cooldown Fix)")
-        print(" All Quality Improvements Implemented")
-        print("="*70)
-        
-        print("\n[INFO] Checking for GPU (CUDA)...")
-        if torch.cuda.is_available():
-            print(f"   [SUCCESS] CUDA is available!")
-            print(f"   Using GPU: {torch.cuda.get_device_name(0)}")
-        else:
-            print("   [WARNING] CUDA not available. Running on CPU (this will be slow).")
-        
-        # --- NEW (V9.9.1): STRIKE SYSTEM ---
-        # This prevents alerts from single bad frames (e.g., shadows)
-        # An issue must be present for this many consecutive frames to be reported.
-        self.STRIKE_THRESHOLD = 5 
-        
-        # Initialize strike counters
-        self.strike_counters = {
-            'pavement': 0,
-            'markings': 0
-        }
-        # --- END STRIKE SYSTEM ---
-        
-        # Configuration with defaults
-        self.config = config or {
-            'pretrained_model': 'models/yolov8s.pt',
-            'finetuned_model': 'models/pothole_detector_v1.pt',
-            'proc_height': 736,
-            'min_confidence': 0.25,
-            'nms_iou_threshold': 0.5,
-            'gps_distance_threshold_km': 5.0,
-            'fps': 5,
-            'batch_size': 1
-        }
-        
-        self.proc_height = self.config['proc_height']
-        self.min_confidence = self.config['min_confidence']
-        
-        print(f"\n[INFO] Configuration:")
-        print(f"   Processing Resolution: {self.proc_height}p")
-        print(f"   Min Confidence: {self.min_confidence}")
-        print(f"   NMS IoU Threshold: {self.config['nms_iou_threshold']}")
-        
-        # Check ExifTool
-        print("\n[0/3] Checking dependencies...")
-        self.use_exiftool = self._check_exiftool()
-        
-        # Load models
-        print("\n[1/3] Loading pre-trained YOLO...")
-        try:
-            self.pretrained_yolo = YOLO(self.config['pretrained_model'])
-            print(f"[SUCCESS] Loaded: {self.config['pretrained_model']}")
-        except Exception as e:
-            print(f"[ERROR] Error loading pre-trained model: {e}")
-            sys.exit(1)
-        
-        print("\n[2/3] Loading fine-tuned model...")
-        finetuned_path = self.config['finetuned_model']
-        
-        if Path(finetuned_path).exists():
+    def _offline_context(self, lat, lon):
+        # Simple fallback
+        return "Urban"
+
+    def get_context(self, lat, lon):
+        key = f"{lat:.4f},{lon:.4f}"
+        if key in self.context_cache:
+            return self.context_cache[key]
+        context = "Urban"
+        if GEOPY_AVAILABLE and self.geolocator is not None:
             try:
-                self.finetuned_model = YOLO(finetuned_path)
-                print(f"[SUCCESS] Loaded: {finetuned_path}")
-                print(f"   Classes: {list(self.finetuned_model.names.values())}")
-                self.use_finetuned = True
-            except Exception as e:
-                print(f"[WARNING] Error: {e}")
-                self.finetuned_model = None
-                self.use_finetuned = False
+                location = self.geolocator.reverse((lat, lon), exactly_one=True, timeout=3)
+                if location:
+                    address = location.raw.get("address", {})
+                    if any(k in address for k in ["motorway", "trunk", "highway"]):
+                        context = "Highway"
+                    elif "residential" in address:
+                        context = "Residential"
+                    elif any(k in address for k in ["intersection", "crossing"]):
+                        context = "Intersection"
+                    else:
+                        context = "Urban"
+                else:
+                    context = self._offline_context(lat, lon)
+            except Exception:
+                context = self._offline_context(lat, lon)
         else:
-            print(f"[WARNING] Not found: {finetuned_path}")
-            self.finetuned_model = None
-            self.use_finetuned = False
-        
-        print("\n[3/3] Initializing OpenCV...")
-        print("[SUCCESS] OpenCV ready")
-        
-        print("\n" + "="*70)
-        print(" PIPELINE SUMMARY")
-        print("="*70)
-        print("\n[INFO] Detection Methods:")
-        print(f"   1. Pre-trained YOLO (conf > {self.min_confidence})")
-        print(f"   2. Fine-tuned Model (conf > {self.min_confidence})" if self.use_finetuned else "   2. Fine-tuned Model (DISABLED)")
-        print("   3. OpenCV Analysis")
-        print("\n[INFO] Quality Features:")
-        print("   - Confidence filtering")
-        print("   - Duplicate removal (NMS)")
-        print("   - Frame-level tracking (with cooldown & strike logic)")
-        print("   - Visual comparisons (with BBoxes)")
-        print("="*70)
-    
-    def _check_exiftool(self):
-        """Check if ExifTool is available"""
-        if not EXIFTOOL_AVAILABLE:
-            print("   [WARNING] exiftool Python module (PyExifTool) not installed")
-            return False
-        
-        try:
-            subprocess.run([EXIFTOOL_PATH, "-ver"], 
-                           check=True, capture_output=True, timeout=5)
-            print("   [SUCCESS] ExifTool available")
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-            print(f"   [ERROR] ExifTool executable not found. Looked for it at:")
-            print(f"   {EXIFTOOL_PATH}")
-            return False
-    
-    def extract_video_metadata(self, video_path):
-        """Extract metadata with enhanced error handling"""
-        print(f"\n[INFO] Extracting metadata: {Path(video_path).name}")
-        
-        metadata = {
-            'video_path': video_path,
-            'gps_data': None,
-            'duration': 0,
-            'fps': 0,
-            'resolution': (0, 0)
+            context = self._offline_context(lat, lon)
+
+        self.context_cache[key] = context
+        return context
+
+    def build_gis_profile(self, lat, lon):
+        key = f"{lat:.4f},{lon:.4f}"
+        if key in self.profile_cache:
+            return self.profile_cache[key]
+
+        context = self.get_context(lat, lon)
+        # defaults
+        traffic_density_adt = 4000
+        heavy_vehicle_share = 0.10
+        recent_rainfall_mm = 20.0
+        drainage_quality = "Moderate"
+        soil_type = "Granular"
+        accident_hotspot = False
+
+        if context == "Highway":
+            traffic_density_adt = 12000
+            heavy_vehicle_share = 0.35
+            drainage_quality = "Good"
+        elif context == "Residential":
+            traffic_density_adt = 2500
+            heavy_vehicle_share = 0.05
+            drainage_quality = "Poor"
+            soil_type = "Clay"
+            recent_rainfall_mm = 60.0
+        elif context == "Intersection":
+            traffic_density_adt = 9000
+            heavy_vehicle_share = 0.20
+            drainage_quality = "Poor"
+            recent_rainfall_mm = 60.0
+            accident_hotspot = True
+        elif context == "Urban":
+            traffic_density_adt = 6000
+            heavy_vehicle_share = 0.15
+            drainage_quality = "Moderate"
+            soil_type = "Mixed"
+            recent_rainfall_mm = 40.0
+
+        profile = {
+            "context": context,
+            "traffic_density_adt": traffic_density_adt,
+            "heavy_vehicle_share": heavy_vehicle_share,
+            "recent_rainfall_mm": recent_rainfall_mm,
+            "drainage_quality": drainage_quality,
+            "soil_type": soil_type,
+            "accident_hotspot": accident_hotspot,
         }
-        
+        self.profile_cache[key] = profile
+        return profile
+
+
+# ---------------------------------------------------------------------
+# Root cause analyzer (GIS + metrics)
+# ---------------------------------------------------------------------
+class RootCauseAnalyzer:
+    def determine_cause(self, defect_type, metrics, gis_profile):
+        ctx = gis_profile.get("context", "Urban")
+        rain = gis_profile.get("recent_rainfall_mm", 0.0)
+        drainage = gis_profile.get("drainage_quality", "Moderate")
+        soil = gis_profile.get("soil_type", "Mixed")
+        traffic_adt = gis_profile.get("traffic_density_adt", 0)
+        hv_share = gis_profile.get("heavy_vehicle_share", 0.1)
+        hotspot = gis_profile.get("accident_hotspot", False)
+
+        cause = "General ageing and service-related deterioration."
+
+        if defect_type == "pothole":
+            if rain >= 50 and drainage in ["Poor", "Blocked"]:
+                cause = "Heavy rainfall + poor drainage → binder stripping and potholes."
+            elif traffic_adt >= 10000 and hv_share >= 0.2:
+                cause = "High traffic + heavy vehicles → fatigue damage and potholes."
+            else:
+                cause = "Local material disintegration and ageing."
+
+        elif defect_type == "crack":
+            crack_w = metrics.get("crack_width_cm", 0)
+            if isinstance(soil, str) and soil.lower() == "clay":
+                cause = "Clay subgrade shrink–swell → longitudinal cracking."
+            elif crack_w >= 6:
+                cause = "Wide cracks indicate fatigue progression due to traffic and aging."
+            else:
+                cause = "Thermal cycles and binder hardening → surface cracking."
+
+        elif defect_type == "faded_markings":
+            wear = metrics.get("marking_wear_pct", 0)
+            if wear > 60 and traffic_adt >= 8000:
+                cause = "High traffic → accelerated abrasion and marking fading."
+            else:
+                cause = "Ageing and UV exposure reduced visibility."
+
+        elif defect_type == "lane_loss":
+            deviation = metrics.get("lane_deviation", 0)
+            if deviation > 0.3 and ctx == "Highway":
+                cause = "Frequent lane changes and lateral wander → lane delineation loss."
+            else:
+                cause = "Inadequate maintenance intervals."
+
+        elif defect_type in ["damaged_sign", "broken_guardrail"]:
+            if hotspot or ctx == "Intersection":
+                cause = "Accident-prone location → impacts to assets."
+            else:
+                cause = "Collision, impact, or vandalism."
+
+        elif defect_type.startswith("missing_"):
+            if ctx == "Highway":
+                cause = "Probable knockdown by a vehicle on a high-speed facility."
+            else:
+                cause = "Possible theft or unauthorized removal."
+
+        return cause
+
+
+# ---------------------------------------------------------------------
+# Visual synchronizer (ORB)
+# ---------------------------------------------------------------------
+class VisualSynchronizer:
+    def __init__(self):
+        self.orb = cv2.ORB_create(nfeatures=1000)
+        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    def _find_match(self, anchor_img, target_video_path):
+        cap = cv2.VideoCapture(str(target_video_path))
+        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        gray1 = cv2.cvtColor(anchor_img, cv2.COLOR_BGR2GRAY)
+        kp1, des1 = self.orb.detectAndCompute(gray1, None)
+
+        best_score = 0
+        best_frame = 0
+        stride = max(1, fps)
+
+        for i in range(0, max(1, total_frames), stride):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            gray2 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            kp2, des2 = self.orb.detectAndCompute(gray2, None)
+            if des1 is None or des2 is None:
+                continue
+            matches = self.bf.match(des1, des2)
+            good = [m for m in matches if m.distance < 50]
+            if len(good) > best_score:
+                best_score = len(good)
+                best_frame = i
+
+        cap.release()
+        return best_frame, best_score
+
+    def get_sync_offsets(self, base_video_path, present_video_path):
+        print("\n[SYNC] Bi-directional visual alignment...")
+        cap_b = cv2.VideoCapture(str(base_video_path))
+        ret_b, frame_b = cap_b.read()
+        cap_b.release()
+
+        cap_p = cv2.VideoCapture(str(present_video_path))
+        ret_p, frame_p = cap_p.read()
+        cap_p.release()
+
+        if not ret_b or not ret_p:
+            print("[SYNC][WARN] Could not read one of the videos; defaulting to no offset.")
+            return 0, 0
+
+        frame_idx_p, score_p = self._find_match(frame_b, present_video_path)
+        frame_idx_b, score_b = self._find_match(frame_p, base_video_path)
+
+        if score_p > score_b and score_p > 20:
+            tqdm.write(f"  Present video starts {frame_idx_p} frames later.")
+            return 0, frame_idx_p
+        elif score_b > score_p and score_b > 20:
+            tqdm.write(f"  Base video starts {frame_idx_b} frames later.")
+            return frame_idx_b, 0
+
+        print("[SYNC] No strong match; using zero offsets.")
+        return 0, 0
+
+
+# ---------------------------------------------------------------------
+# Comparator engine
+# ---------------------------------------------------------------------
+class EnhancedRoadAuditSystem:
+    def __init__(self, config=None):
+        print("=" * 72)
+        print(" ROAD SAFETY AUDIT SYSTEM – PENULTIMATE COMPARATOR ENGINE ")
+        print("=" * 72)
+    
+
+        # Device detection
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[DEVICE] Using device: {self.device}")
+
+        # default config
+        self.config = {
+            "pretrained_model": str(BASE_MODEL_PATH),
+            "finetuned_model": str(BEST_MODEL_PATH),
+            "segmentation_model": str(SEG_MODEL_PATH),
+            "proc_height": 640,
+            "min_confidence": 0.25,
+            "fps": 5,
+            "change_cooldown_frames": 3,
+            "occlusion_persistence_frames": 5,
+            "vegetation_hue_low": 25,
+            "vegetation_hue_high": 100,
+            "vegetation_saturation_min": 40,
+            "vegetation_value_min": 40,
+            "guardrail_occlusion_thresh": 0.08,
+        }
+        if config:
+            self.config.update(config)
+
+        self.gis_engine = GISContextEngine()
+        self.rca = RootCauseAnalyzer()
+
+        self.pci_stats = {"potholes": 0, "crack_len_px": 0.0, "faded_marks": 0, "total_frames": 0}
+        self.pixel_to_cm_scale = 0.5
+        self.global_gis_profile = None
+
+        # temporal and occlusion state
+        self.recent_events = []
+        self.event_cooldown = self.config["change_cooldown_frames"]
+        self.occlusion_state = {}
+        self.pipeline_logs = []
+        self.suppressed_events = []
+
+        self._load_models()
+
+
+    def _reset_pci_stats(self):
+        """Reset PCI statistics for a new video"""
+        return {"potholes": 0, "crack_len_px": 0.0, "faded_marks": 0, "total_frames": 0}
+
+
+    def _log(self, msg):
+        print(msg)
+        self.pipeline_logs.append(msg)
+
+    def _load_models(self):
+        # custom model
         try:
-            cap = cv2.VideoCapture(video_path)
-            if cap.isOpened():
-                metadata['fps'] = int(cap.get(cv2.CAP_PROP_FPS))
-                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                if metadata['fps'] > 0:
-                    metadata['duration'] = total_frames / metadata['fps']
-                metadata['resolution'] = (
-                    int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                    int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                )
-                cap.release()
-            
-            print(f"   Duration: {metadata['duration']:.1f}s, FPS: {metadata['fps']}, Res: {metadata['resolution']}")
-        except cv2.error as e:
-            print(f"   [WARNING] OpenCV error reading video properties: {e}")
-        
-        # GPS extraction
-        gps_found = False
-        if self.use_exiftool:
+            self.custom_model = YOLO(self.config["finetuned_model"])
+            print(f"[INIT] Loaded custom model: {self.config['finetuned_model']}")
+        except Exception as e:
+            print(f"[CRIT] Failed to load custom model: {e}")
+            raise
+
+        # base model fallback
+        try:
+            if Path(self.config["pretrained_model"]).exists():
+                self.base_model = YOLO(self.config["pretrained_model"])
+                print(f"[INIT] Loaded base model (fallback): {self.config['pretrained_model']}")
+            else:
+                self.base_model = None
+                print("[INIT][WARN] Base model not found; fallback disabled.")
+        except Exception as e:
+            print(f"[WARN] Failed to load base model: {e}")
+            self.base_model = None
+
+        # segmentation model
+        seg_ready = ensure_segmentation_model()
+        if seg_ready and SEG_MODEL_PATH.exists():
+            try:
+                self.seg_model = YOLO(str(SEG_MODEL_PATH))
+                print(f"[INIT] Loaded segmentation model: {SEG_MODEL_PATH}")
+            except Exception as e:
+                print(f"[WARN] Failed to load segmentation model: {e}")
+                self.pipeline_logs.append(f"Segmentation model load failure: {e}")
+                self.seg_model = None
+        else:
+            self.seg_model = None
+            print("[INIT][WARN] Segmentation model unavailable; marking analysis limited.")
+            self.pipeline_logs.append("Segmentation model unavailable; using OpenCV-only marking analysis.")
+
+    # ----------------- guardrail occlusion -----------------
+    def _is_guardrail_occluded_by_vegetation(self, frame, bbox):
+        x1, y1, x2, y2 = map(int, bbox)
+        h, w = frame.shape[:2]
+        x1 = max(0, min(w - 1, x1))
+        x2 = max(0, min(w - 1, x2))
+        y1 = max(0, min(h - 1, y1))
+        y2 = max(0, min(h - 1, y2))
+        if x2 - x1 <= 2 or y2 - y1 <= 2:
+            return False, 0.0
+        roi = frame[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        low = np.array([self.config["vegetation_hue_low"], self.config["vegetation_saturation_min"], self.config["vegetation_value_min"]])
+        high = np.array([self.config["vegetation_hue_high"], 255, 255])
+        mask = cv2.inRange(hsv, low, high)
+        frac = np.count_nonzero(mask) / mask.size if mask.size > 0 else 0.0
+        return frac >= self.config["guardrail_occlusion_thresh"], float(frac)
+
+    # ----------------- crack width measurement -----------------
+    def _measure_crack_width_px(self, frame, bbox):
+        x1, y1, x2, y2 = map(int, bbox)
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+        dist = cv2.distanceTransform(thresh, cv2.DIST_L2, 5)
+        return float(np.max(dist) * 2)
+
+    def _update_scale_from_lanes(self, frame, lane_masks):
+        if not lane_masks:
+            return
+        h, w = frame.shape[:2]
+        cx = w // 2
+        centers = []
+        for mask in lane_masks:
+            ys, xs = np.where(mask > 0)
+            if len(xs) == 0:
+                continue
+            centers.append(int(np.median(xs)))
+        if len(centers) < 2:
+            return
+        centers = sorted(centers)
+        left_candidates = [c for c in centers if c < cx]
+        right_candidates = [c for c in centers if c > cx]
+        if not left_candidates or not right_candidates:
+            return
+        left = max(left_candidates)
+        right = min(right_candidates)
+        lane_width_px = abs(right - left)
+        if lane_width_px <= 0:
+            return
+        lane_width_cm = 350.0  # 3.5m
+        scale = lane_width_cm / lane_width_px
+        self.pixel_to_cm_scale = 0.7 * self.pixel_to_cm_scale + 0.3 * scale
+
+    # ----------------- marking analysis -----------------
+    def _analyze_markings(self, frame):
+        h, w = frame.shape[:2]
+        markings_info = {"lane_markings_present": False, "center_line_present": False, "stop_line_present": False, "zebra_present": False, "marking_wear_pct": 0.0}
+        marking_dets = []
+        lane_masks = []
+
+        if self.seg_model is None:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            roi = hsv[int(h * 0.6):, :]
+            mask_white = cv2.inRange(roi, (0, 0, 160), (180, 60, 255))
+            ratio = np.count_nonzero(mask_white) / mask_white.size if mask_white.size > 0 else 0.0
+            if ratio > 0.20:
+                markings_info["zebra_present"] = True
+            markings_info["marking_wear_pct"] = float(max(0.0, min(100.0, (1 - ratio) * 100)))
+            return markings_info, marking_dets
+
+        try:
+            result = self.seg_model(frame, verbose=False, device=self.device)[0]
+        except Exception as e:
+            self._log(f"[SEG][ERROR] Segmentation inference failed: {e}")
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            roi = hsv[int(h * 0.6):, :]
+            mask_white = cv2.inRange(roi, (0, 0, 160), (180, 60, 255))
+            ratio = np.count_nonzero(mask_white) / mask_white.size if mask_white.size > 0 else 0.0
+            if ratio > 0.20:
+                markings_info["zebra_present"] = True
+            markings_info["marking_wear_pct"] = float(max(0.0, min(100.0, (1 - ratio) * 100)))
+            return markings_info, marking_dets
+
+        masks = getattr(result, "masks", None)
+        if masks is None or getattr(masks, "data", None) is None:
+            return markings_info, marking_dets
+
+        mask_arr = masks.data.cpu().numpy()
+        cls_ids = result.boxes.cls.cpu().numpy().astype(int) if result.boxes is not None else np.array([])
+
+        n_masks = mask_arr.shape[0]
+        n_boxes = cls_ids.shape[0]
+        count = min(n_masks, n_boxes) if n_boxes > 0 else n_masks
+
+        total_area = 0
+        fade_weighted_area = 0
+
+        for idx in range(count):
+            m = mask_arr[idx]
+            cls_id = int(cls_ids[idx]) if idx < len(cls_ids) else -1
+            cls_name = str(self.seg_model.names.get(cls_id, f"class_{cls_id}")).lower() if self.seg_model else f"class_{cls_id}"
+            binary_mask = (m > 0.5).astype(np.uint8)
+            area = int(np.count_nonzero(binary_mask))
+            if area == 0:
+                continue
+            total_area += area
+            det = {"label": cls_name, "area_px": area}
+            if "lane" in cls_name or "edge" in cls_name:
+                markings_info["lane_markings_present"] = True
+                lane_masks.append(binary_mask)
+            if "center" in cls_name:
+                markings_info["center_line_present"] = True
+            if "stop" in cls_name:
+                markings_info["stop_line_present"] = True
+            if "zebra" in cls_name or "pedestrian" in cls_name:
+                markings_info["zebra_present"] = True
+            ys, xs = np.where(binary_mask > 0)
+            if len(xs) > 0:
+                intensities = frame[ys, xs].mean(axis=1)
+                mean_int = float(np.mean(intensities))
+                fade = max(0.0, min(1.0, (200 - mean_int) / 80.0))
+                det["fade_ratio"] = fade
+                fade_weighted_area += fade * area
+            marking_dets.append(det)
+
+        if total_area > 0:
+            avg_fade = fade_weighted_area / total_area
+            markings_info["marking_wear_pct"] = float(avg_fade * 100.0)
+
+        if lane_masks:
+            self._update_scale_from_lanes(frame, lane_masks)
+
+        return markings_info, marking_dets
+
+    # ----------------- metadata extraction -----------------
+    def extract_video_metadata(self, video_path):
+        video_path = str(video_path)
+        meta = {"gps_data": None, "fps": 0, "duration": 0}
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            meta["fps"] = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            total = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            if meta["fps"] > 0:
+                meta["duration"] = total / meta["fps"]
+        cap.release()
+
+        match = re.search(r"(\d+\.\d+)[_,\s]+(\d+\.\d+)", Path(video_path).name)
+        if match:
+            meta["gps_data"] = {"latitude": float(match.group(1)), "longitude": float(match.group(2))}
+        elif EXIFTOOL_AVAILABLE:
             try:
                 with exiftool.ExifToolHelper() as et:
-                    meta_dict_list = et.get_metadata(video_path)
-                    if meta_dict_list:
-                        meta_dict = meta_dict_list[0]
-                        
-                        if 'Composite:GPSLatitude' in meta_dict and 'Composite:GPSLongitude' in meta_dict:
-                            lat = meta_dict['Composite:GPSLatitude']
-                            lon = meta_dict['Composite:GPSLongitude']
-                            
-                            if isinstance(lat, (float, int)) and isinstance(lon, (float, int)):
-                                metadata['gps_data'] = {
-                                    'latitude': float(lat),
-                                    'longitude': float(lon),
-                                    'source': 'video_metadata'
-                                }
-                                print(f"   [SUCCESS] GPS (metadata): {lat:.6f}, {lon:.6f}")
-                                gps_found = True
+                    tags = et.get_metadata(video_path)[0]
+                    if "Composite:GPSLatitude" in tags and "Composite:GPSLongitude" in tags:
+                        meta["gps_data"] = {"latitude": tags["Composite:GPSLatitude"], "longitude": tags["Composite:GPSLongitude"]}
             except Exception as e:
-                print(f"   [WARNING] ExifTool error: {e}")
+                self._log(f"[EXIF][WARN] Failed to read GPS from EXIF: {e}")
+
+        return meta
+
+    # ----------------- frame extraction -----------------
+    def extract_frames(self, video_path, output_folder, fps=1, start_frame=0):
+        output_folder = Path(output_folder)
+        output_folder.mkdir(parents=True, exist_ok=True)
         
-        # Fallback to filename
-        if not gps_found:
-            filename = Path(video_path).stem
-            gps_pattern = r'(\d+\.\d+)[_,\s]+(\d+\.\d+)'
-            match = re.search(gps_pattern, filename)
-            
-            if match:
-                metadata['gps_data'] = {
-                    'latitude': float(match.group(1)),
-                    'longitude': float(match.group(2)),
-                    'source': 'filename'
-                }
-                print(f"   [SUCCESS] GPS (filename): {match.group(1)}, {match.group(2)}")
-            else:
-                print(f"   [WARNING] No GPS data found")
-        
-        return metadata
-    
-    def validate_video_compatibility(self, base_metadata, present_metadata):
-        """
-        Validate that videos are compatible for comparison
-        """
-        print("\n[INFO] Validating video compatibility...")
-        
-        issues = []
-        warnings = []
-        
-        # GPS distance check
-        if base_metadata['gps_data'] and present_metadata['gps_data']:
-            lat1 = radians(base_metadata['gps_data']['latitude'])
-            lon1 = radians(base_metadata['gps_data']['longitude'])
-            lat2 = radians(present_metadata['gps_data']['latitude'])
-            lon2 = radians(present_metadata['gps_data']['longitude'])
-            
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-            c = 2 * atan2(sqrt(a), sqrt(1-a))
-            distance_km = 6371 * c
-            
-            print(f"   GPS Distance: {distance_km:.2f} km")
-            
-            threshold = self.config['gps_distance_threshold_km']
-            if distance_km > threshold:
-                issues.append(f"Videos are {distance_km:.2f} km apart (threshold: {threshold} km)")
-            elif distance_km > threshold / 5:
-                warnings.append(f"Videos are {distance_km:.2f} km apart")
-            else:
-                print(f"   [SUCCESS] GPS check passed")
-        else:
-            warnings.append("GPS data unavailable - cannot verify location")
-        
-        # Resolution check
-        if base_metadata['resolution'] != present_metadata['resolution']:
-            warnings.append(f"Different resolutions: {base_metadata['resolution']} vs {present_metadata['resolution']}")
-        else:
-            print(f"   [SUCCESS] Resolution match")
-        
-        # Duration check
-        duration_diff = abs(base_metadata['duration'] - present_metadata['duration'])
-        if duration_diff > max(base_metadata['duration'], present_metadata['duration']) * 0.5:
-            warnings.append(f"Duration differs significantly: {duration_diff:.1f}s")
-        else:
-            print(f"   [SUCCESS] Duration similar")
-        
-        # Display results
-        if issues:
-            print("\n[ERROR] VALIDATION FAILED")
-            for issue in issues:
-                print(f"   - {issue}")
-            print("   Aborting due to validation failure.")
-            return False # Auto-fail
-        
-        if warnings:
-            print("\n[WARNINGS]")
-            for warning in warnings:
-                print(f"   - {warning}")
-            print("   Proceeding with warnings...")
-            return True # Auto-proceed
-        
-        print("   [SUCCESS] All validations passed")
-        return True
-    
-    def extract_frames(self, video_path, output_folder, fps=1):
-        """Extract and resize frames with enhanced error handling"""
-        print(f"\n[INFO] Extracting: {Path(video_path).name} -> {self.proc_height}p @ {fps} FPS")
-        
-        Path(output_folder).mkdir(parents=True, exist_ok=True)
-        
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                raise IOError(f"Cannot open video: {video_path}")
-            
-            frame_rate = int(cap.get(cv2.CAP_PROP_FPS))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            original_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            original_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
-            new_h = self.proc_height
-            new_w = int(original_w * (new_h / original_h))
-            
-            frame_skip = max(1, frame_rate // fps)
-            
-            frames = []
-            count, saved = 0, 0
-            errors = 0
-            
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+        # ROBUST CLEANUP: Try multiple times
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            old_frames = list(output_folder.glob("frame_*.jpg"))
+            if not old_frames:
+                break
                 
-                if count % frame_skip == 0:
-                    try:
-                        resized_frame = cv2.resize(frame, (new_w, new_h), 
-                                                   interpolation=cv2.INTER_AREA)
-                        frame_path = f"{output_folder}/frame_{saved:06d}.jpg"
-                        cv2.imwrite(frame_path, resized_frame)
-                        frames.append(frame_path)
-                        saved += 1
-                    except cv2.error as e:
-                        errors += 1
-                        print(f"\n   [WARNING] Error at frame {count}: {e}")
-                        if errors > 10:
-                            print(f"   [ERROR] Too many errors, aborting")
-                            break
-                
-                count += 1
-                if count % 100 == 0:
-                    print(f"   Progress: {count}/{total_frames}...", end='\r')
+            for old in old_frames:
+                try:
+                    old.unlink()
+                except Exception as e:
+                    if attempt == max_attempts - 1:
+                        self._log(f"[WARN] Could not delete old frame {old}: {e}")
             
+            # Verify deletion
+            remaining = list(output_folder.glob("frame_*.jpg"))
+            if not remaining:
+                break
+            
+            if attempt < max_attempts - 1:
+                import time
+                time.sleep(0.2)
+        
+        # Check if old frames still exist
+        if list(output_folder.glob("frame_*.jpg")):
+            self._log(f"[ERROR] Failed to clear old frames in {output_folder}")
+            raise RuntimeError(f"Cannot clear old frames in {output_folder}. Close any programs using these files.")
+
+        t_offset = 0.0
+        if start_frame > 0:
+            cap = cv2.VideoCapture(str(video_path))
+            native_fps = cap.get(cv2.CAP_PROP_FPS) or float(fps)
             cap.release()
-            del frame
-            gc.collect()
-            
-            print(f"\n[SUCCESS] Extracted {len(frames)} frames")
-            if errors > 0:
-                print(f"   [WARNING] {errors} frames had errors")
-            
-            return frames
-            
-        except MemoryError:
-            print(f"\n[ERROR] Out of memory!")
-            print(f"   Try reducing proc_height (current: {self.proc_height})")
-            raise
+            if native_fps > 0:
+                t_offset = start_frame / native_fps
+
+        if not FFMPEG_PATH.exists():
+            self._log(f"[FFMPEG][WARN] FFmpeg not found at {FFMPEG_PATH}. Falling back to OpenCV.")
+            return self._extract_frames_opencv(video_path, output_folder, fps, start_frame)
+
+        cmd = [str(FFMPEG_PATH), "-y"]
+        if t_offset > 0:
+            cmd.extend(["-ss", f"{t_offset:.3f}"])
+        cmd.extend(["-i", str(video_path), "-vf", f"fps={fps}", str(output_folder / "frame_%05d.jpg"), "-hide_banner", "-loglevel", "error"])
+
+        print(f"[FFMPEG] Extracting frames from {video_path} at {fps} fps (offset {t_offset:.3f}s)")
+        try:
+            subprocess.run(cmd, check=True)
         except Exception as e:
-            print(f"\n[ERROR] Unexpected error: {type(e).__name__}: {e}")
-            raise
-    
-    def _filter_by_confidence(self, detections):
-        return [d for d in detections if d.get('confidence', 0) >= self.min_confidence]
-    
-    def _remove_duplicates_nms(self, detections):
-        if len(detections) < 2:
-            return detections
-        
-        sorted_dets = sorted(detections, key=lambda x: x.get('confidence', 0), reverse=True)
-        
-        keep = []
-        iou_threshold = self.config['nms_iou_threshold']
-        
-        while sorted_dets:
-            best = sorted_dets.pop(0)
-            keep.append(best)
-            
-            filtered = []
-            for det in sorted_dets:
-                iou = self._calculate_iou(best['bbox'], det['bbox'])
-                if iou < iou_threshold:
-                    filtered.append(det)
-            
-            sorted_dets = filtered
-        
-        return keep
-    
-    def _calculate_iou(self, bbox1, bbox2):
-        try:
-            x1_1, y1_1, x2_1, y2_1 = bbox1
-            x1_2, y1_2, x2_2, y2_2 = bbox2
-            
-            ix1 = max(x1_1, x1_2)
-            iy1 = max(y1_1, y1_2)
-            ix2 = min(x2_1, x2_2)
-            iy2 = min(y2_1, y2_2)
-            
-            if ix2 <= ix1 or iy2 <= iy1:
-                return 0.0
-            
-            intersection = (ix2 - ix1) * (iy2 - iy1)
-            area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-            area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-            union = area1 + area2 - intersection
-            
-            return intersection / union if union > 0 else 0.0
-        except:
-            return 0.0
-            
-    # --- NEW (V9.8): Helper function to draw boxes ---
-    def _draw_boxes(self, image, detections, color, label_prefix=""):
-        """Draws bounding boxes on an image."""
-        for det in detections:
-            try:
-                # Bounding box
-                x1, y1, x2, y2 = [int(coord) for coord in det['bbox']]
-                cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-                
-                # Label
-                label = det.get('label', label_prefix)
-                conf = det.get('confidence', 0)
-                text = f"{label} ({conf:.2f})"
-                
-                # Text background
-                (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(image, (x1, y1 - h - 10), (x1 + w, y1), color, -1)
-                
-                # Text
-                cv2.putText(image, text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-            except Exception as e:
-                print(f" [WARNING] Failed to draw box: {e}")
-        # No return, modifies image in-place
-    # --- END NEW ---
+            self._log(f"[FFMPEG][ERROR] Frame extraction failed: {e}")
+            return self._extract_frames_opencv(video_path, output_folder, fps, start_frame)
 
-    def _run_cv_analysis(self, frame_path):
-        try:
-            img = cv2.imread(frame_path)
-            if img is None:
-                return {'pavement': {}, 'markings': {}}
-            
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-            h, w = gray.shape
-            
-            # Pavement analysis
-            edges = cv2.Canny(gray, 50, 150)
-            crack_density = np.sum(edges > 0) / edges.size
-            
-            if crack_density > 0.08:
-                severity, score = 'severe', 0
-            elif crack_density > 0.05:
-                severity, score = 'moderate', 40
-            elif crack_density > 0.02:
-                severity, score = 'minor', 70
-            else:
-                severity, score = 'good', 100
-            
-            pavement = { 'crack_density': float(crack_density), 'severity': severity, 'score': score }
-            
-            # Marking analysis
-            lower_white = np.array([0, 0, 200])
-            upper_white = np.array([180, 30, 255])
-            white_mask = cv2.inRange(hsv, lower_white, upper_white)
-            lower_yellow = np.array([20, 100, 100])
-            upper_yellow = np.array([30, 255, 255])
-            yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
-            
-            marking_mask = cv2.bitwise_or(white_mask, yellow_mask)
-            marking_pixels = np.sum(marking_mask > 0)
-            
-            if marking_pixels > 200:
-                brightness = np.mean(gray[marking_mask > 0])
-                if brightness < 140:
-                    condition, m_score = 'severely_faded', 20
-                elif brightness < 180:
-                    condition, m_score = 'faded', 50
-                else:
-                    condition, m_score = 'good', 100
-            else:
-                condition, m_score = 'missing', 0
-            
-            markings = { 'condition': condition, 'score': m_score }
-            
-            return {'pavement': pavement, 'markings': markings}
-            
-        except cv2.error:
-            return {'pavement': {}, 'markings': {}}
-        except Exception:
-            return {'pavement': {}, 'markings': {}}
-    
-    def _collate_frame_results(self, frame_path, pretrained_result, finetuned_result, cv_analysis):
-        """
-        Collate results with confidence filtering and NMS
-        FIX (V9.9): Added 'Guardrail Filter'
-        """
-        results = {
-            'frame': frame_path,
-            'road_signs': [],
-            'furniture': [],
-            'vru': [],
-            'potholes': [],
-            'cracks': [],
-            'traffic_lights': [],
-            'pavement': cv_analysis.get('pavement', {}),
-            'markings': cv_analysis.get('markings', {})
-        }
+        frames = sorted(str(p) for p in output_folder.glob("frame_*.jpg"))
         
-        # Collect pre-trained YOLO results
-        if pretrained_result and hasattr(pretrained_result, 'boxes'):
-            for box in pretrained_result.boxes:
-                conf = float(box.conf[0])
-                
-                if conf < self.min_confidence:
-                    continue
-                
-                cls_id = int(box.cls[0])
-                label = self.pretrained_yolo.names[cls_id]
-                detection = { 'label': label, 'confidence': conf, 'bbox': box.xyxy[0].tolist() }
-                
-                if label in ['stop sign']:
-                    results['road_signs'].append(detection)
-                elif label in ['traffic light']:
-                    results['traffic_lights'].append(detection)
-                elif label in ['bench', 'fire hydrant', 'parking meter']:
-                    # --- NEW (V9.9) - GUARDRAIL FILTER ---
-                    # Check if a "bench" is suspiciously wide (likely a guardrail)
-                    if label == 'bench':
-                        bbox = box.xyxy[0].tolist()
-                        box_width = bbox[2] - bbox[0]
-                        # Get frame width from the original image result
-                        frame_width = pretrained_result.orig_shape[1] 
-                        
-                        # If box is wider than 60% of the screen, ignore it.
-                        if (box_width / frame_width) > 0.6:
-                            continue # Skip this detection
-                    # --- END GUARDRAIL FILTER ---
-                    results['furniture'].append(detection)
-                elif label in ['person', 'bicycle', 'motorcycle']:
-                    results['vru'].append(detection)
+        # VALIDATION: Ensure frames were actually created
+        if not frames:
+            self._log(f"[ERROR] No frames extracted from {video_path}")
+            raise RuntimeError(f"Frame extraction failed for {video_path}")
         
-        # Collect fine-tuned results
-        if self.use_finetuned and finetuned_result and hasattr(finetuned_result, 'boxes'):
-            for box in finetuned_result.boxes:
-                conf = float(box.conf[0])
-                
-                if conf < self.min_confidence:
-                    continue
-                
-                cls_id = int(box.cls[0])
-                label = self.finetuned_model.names[cls_id]
-                detection = { 'label': label, 'confidence': conf, 'bbox': box.xyxy[0].tolist() }
-                
-                if 'pothole' in label.lower():
-                    results['potholes'].append(detection)
-                elif 'crack' in label.lower():
-                    results['cracks'].append(detection)
-        
-        results['potholes'] = self._remove_duplicates_nms(results['potholes'])
-        results['cracks'] = self._remove_duplicates_nms(results['cracks'])
-        results['road_signs'] = self._remove_duplicates_nms(results['road_signs'])
-        results['traffic_lights'] = self._remove_duplicates_nms(results['traffic_lights'])
-        results['furniture'] = self._remove_duplicates_nms(results['furniture'])
-        results['vru'] = self._remove_duplicates_nms(results['vru'])
-        
-        return results
-    
-    def _run_analysis_pipeline(self, frame_paths, batch_size=1):
-        """Run analysis with error handling"""
-        if not frame_paths:
+        self._log(f"[FFMPEG] Extracted {len(frames)} frames successfully")
+        return frames
+
+
+    def _extract_frames_opencv(self, video_path, output_folder, fps, start_frame):
+        output_folder = Path(output_folder)
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            self._log(f"[CV][ERROR] Could not open video: {video_path}")
             return []
-        
-        print(f"\n[ML] Processing {len(frame_paths)} frames (batch={batch_size})...")
-        
-        all_pretrained = []
-        all_finetuned = []
-        total_batches = (len(frame_paths) + batch_size - 1) // batch_size
-        
-        for i in range(0, len(frame_paths), batch_size):
-            batch_paths = frame_paths[i:i + batch_size]
-            print(f"   Batch {i // batch_size + 1}/{total_batches}...", end='\r')
-            
-            try:
-                pretrained_batch = self.pretrained_yolo(batch_paths, verbose=False, imgsz=self.proc_height)
-                all_pretrained.extend(pretrained_batch)
-                
-                if self.use_finetuned:
-                    finetuned_batch = self.finetuned_model(batch_paths, verbose=False, imgsz=self.proc_height)
-                    all_finetuned.extend(finetuned_batch)
-                
-                del pretrained_batch
-                if self.use_finetuned: del finetuned_batch
-                gc.collect()
-                
-            except MemoryError:
-                print(f"\n   [ERROR] Out of memory at batch {i // batch_size + 1}")
-                print(f"   Try reducing batch_size (current: {batch_size})")
-                raise
-            except Exception as e:
-                print(f"\n   [WARNING] Error in batch {i // batch_size + 1}: {e}")
-                all_pretrained.extend([None] * len(batch_paths))
-                if self.use_finetuned:
-                    all_finetuned.extend([None] * len(batch_paths))
-                gc.collect()
-        
-        if not self.use_finetuned:
-            all_finetuned = [None] * len(frame_paths)
-        
-        print(f"\n[SUCCESS] ML complete")
-        
-        print(f"\n[CV] Analyzing {len(frame_paths)} frames...")
-        all_results = []
-        for i, frame_path in enumerate(frame_paths):
-            print(f"   Frame {i+1}/{len(frame_paths)}...", end='\r')
-            cv_analysis = self._run_cv_analysis(frame_path)
-            frame_data = self._collate_frame_results(
-                frame_path, all_pretrained[i], all_finetuned[i], cv_analysis
-            )
-            all_results.append(frame_data)
-        
-        print(f"\n[SUCCESS] CV complete")
-        return all_results
-    
-    def _compare_frame_by_frame(self, base_results, present_results, fps):
-        """
-        Frame-level change detection with cooldown logic
-        FIX (V9.9.2): Increased cooldown period to 10 seconds to stop repetitions.
-        """
-        print("\n   Performing frame-by-frame comparison (with cooldown & strike logic)...")
-        
-        changes = []
-        min_frames = min(len(base_results), len(present_results))
-        
-        cooldowns = {
-            'potholes': 0, 'cracks': 0, 'signs': 0,
-            'traffic_lights': 0, 'furniture': 0, 'vru': 0
-        }
-        
-        # --- THIS IS THE FIX ---
-        # Was `fps * 2` (2 seconds), which was too short and caused spam.
-        # Now it's `fps * 10` (10 seconds).
-        cooldown_period = fps * 10
-        # --- END FIX ---
-        
-        for i in range(min_frames):
-            base = base_results[i]
-            present = present_results[i]
-            frame_changes = []
-            
-            # Compare Potholes (Cooldown)
-            if i >= cooldowns['potholes']:
-                base_val = len(base.get('potholes', []))
-                present_val = len(present.get('potholes', []))
-                if present_val > base_val:
-                    frame_changes.append({'element': 'Potholes', 'type': 'new_defects', 'severity': 'high', 'from': base_val, 'to': present_val, 'change': present_val - base_val})
-                    cooldowns['potholes'] = i + cooldown_period
-            
-            # Compare Cracks (Cooldown)
-            if i >= cooldowns['cracks']:
-                base_val = len(base.get('cracks', []))
-                present_val = len(present.get('cracks', []))
-                if present_val > base_val + 1:
-                    frame_changes.append({'element': 'Cracks', 'type': 'increased', 'severity': 'medium', 'from': base_val, 'to': present_val, 'change': present_val - base_val})
-                    cooldowns['cracks'] = i + cooldown_period
-            
-            # --- MODIFIED (V9.9.1): Use Strike System for Pavement ---
-            base_pav = base.get('pavement', {})
-            present_pav = present.get('pavement', {})
-            if base_pav and present_pav:
-                base_score = base_pav.get('score', 100)
-                present_score = present_pav.get('score', 100)
-                
-                if present_score < base_score - 25:
-                    self.strike_counters['pavement'] += 1 # Add a strike
-                else:
-                    self.strike_counters['pavement'] = 0 # Reset
-                    
-                if self.strike_counters['pavement'] == self.STRIKE_THRESHOLD:
-                    frame_changes.append({'element': 'Pavement Condition', 'type': 'deterioration', 'severity': 'high' if present_score < 40 else 'medium', 'from': base_pav.get('severity', 'unknown'), 'to': present_pav.get('severity', 'unknown'), 'score_change': base_score - present_score})
-                    self.strike_counters['pavement'] = 0 # Reset after reporting
-            
-            # --- MODIFIED (V9.9.1): Use Strike System for Markings ---
-            base_mark = base.get('markings', {})
-            present_mark = present.get('markings', {})
-            if base_mark and present_mark:
-                base_cond = base_mark.get('condition', 'unknown')
-                present_cond = present_mark.get('condition', 'unknown')
-                
-                if base_cond == 'good' and present_cond in ['faded', 'severely_faded', 'missing']:
-                    self.strike_counters['markings'] += 1 # Add a strike
-                else:
-                    self.strike_counters['markings'] = 0 # Reset
-                    
-                if self.strike_counters['markings'] == self.STRIKE_THRESHOLD:
-                    frame_changes.append({'element': 'Road Markings', 'type': 'fading', 'severity': 'high' if present_cond == 'missing' else 'medium', 'from': base_cond, 'to': present_cond})
-                    self.strike_counters['markings'] = 0 # Reset after reporting
-            
-            # Compare Signs (Cooldown)
-            if i >= cooldowns['signs']:
-                base_val = len(base.get('road_signs', []))
-                present_val = len(present.get('road_signs', []))
-                if present_val < base_val:
-                    frame_changes.append({'element': 'Road Signs', 'type': 'missing', 'severity': 'high', 'from': base_val, 'to': present_val})
-                    cooldowns['signs'] = i + cooldown_period
-            
-            # Compare Traffic Lights (Cooldown)
-            if i >= cooldowns['traffic_lights']:
-                base_val = len(base.get('traffic_lights', []))
-                present_val = len(present.get('traffic_lights', []))
-                if present_val < base_val:
-                    frame_changes.append({'element': 'Traffic Lights', 'type': 'missing_or_offline', 'severity': 'high', 'from': base_val, 'to': present_val})
-                    cooldowns['traffic_lights'] = i + cooldown_period
-
-            # Compare Furniture (Cooldown)
-            if i >= cooldowns['furniture']:
-                base_val = len(base.get('furniture', []))
-                present_val = len(present.get('furniture', []))
-                if present_val < base_val:
-                    frame_changes.append({'element': 'Road Furniture', 'type': 'missing', 'severity': 'low', 'from': base_val, 'to': present_val})
-                    cooldowns['furniture'] = i + cooldown_period
-
-            # Compare VRUs (Cooldown)
-            if i >= cooldowns['vru']:
-                base_val = len(base.get('vru', []))
-                present_val = len(present.get('vru', []))
-                if present_val > (base_val * 2) and present_val > 5:
-                    frame_changes.append({'element': 'VRU Presence', 'type': 'significant_increase', 'severity': 'medium', 'from': base_val, 'to': present_val})
-                    cooldowns['vru'] = i + cooldown_period
-            
-            if frame_changes:
-                changes.append({
-                    'frame_id': i,
-                    'timestamp_seconds': i / fps,
-                    'changes': frame_changes
-                })
-        
-        return changes
-    
-    def save_comparison_images(self, base_results, present_results, frame_level_changes, output_folder='results/comparisons'):
-        """
-        Save visual comparisons for frames with changes
-        --- MODIFIED (V9.8): Now draws all bounding boxes ---
-        """
-        print(f"\n   Creating visual comparisons with bounding boxes...")
-        Path(output_folder).mkdir(parents=True, exist_ok=True)
-        
-        # Define colors
-        COLOR_DEFECT = (0, 0, 255)     # Red for potholes/cracks
-        COLOR_ASSET = (0, 255, 0)      # Green for signs/lights
-        COLOR_FURNITURE = (255, 200, 0) # Light Blue for furniture
-        COLOR_VRU = (255, 0, 255)    # Magenta for VRUs
-        
+        native_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+        skip = max(1, int(native_fps // fps))
+        if start_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frames = []
+        idx = 0
         saved = 0
-        for change_data in frame_level_changes[:10]: # First 10 changes
-            frame_id = change_data['frame_id']
-            try:
-                # Get the full data for this frame
-                base_data = base_results[frame_id]
-                present_data = present_results[frame_id]
-                
-                # Load images
-                base_img = cv2.imread(base_data['frame'])
-                present_img = cv2.imread(present_data['frame'])
-                if base_img is None or present_img is None: continue
-                
-                # --- Draw all boxes on both images ---
-                # Draw on BASE image
-                self._draw_boxes(base_img, base_data['potholes'], COLOR_DEFECT, "Pothole")
-                self._draw_boxes(base_img, base_data['cracks'], COLOR_DEFECT, "Crack")
-                self._draw_boxes(base_img, base_data['road_signs'], COLOR_ASSET, "Sign")
-                self._draw_boxes(base_img, base_data['traffic_lights'], COLOR_ASSET, "Light")
-                self._draw_boxes(base_img, base_data['furniture'], COLOR_FURNITURE, "Furniture")
-                self._draw_boxes(base_img, base_data['vru'], COLOR_VRU, "VRU")
-
-                # Draw on PRESENT image
-                self._draw_boxes(present_img, present_data['potholes'], COLOR_DEFECT, "Pothole")
-                self._draw_boxes(present_img, present_data['cracks'], COLOR_DEFECT, "Crack")
-                self._draw_boxes(present_img, present_data['road_signs'], COLOR_ASSET, "Sign")
-                self._draw_boxes(present_img, present_data['traffic_lights'], COLOR_ASSET, "Light")
-                self._draw_boxes(present_img, present_data['furniture'], COLOR_FURNITURE, "Furniture")
-                self._draw_boxes(present_img, present_data['vru'], COLOR_VRU, "VRU")
-                # --- End drawing ---
-
-                # Ensure same height
-                h = min(base_img.shape[0], present_img.shape[0])
-                base_resized = cv2.resize(base_img, (int(base_img.shape[1] * h / base_img.shape[0]), h))
-                present_resized = cv2.resize(present_img, (int(present_img.shape[1] * h / present_img.shape[0]), h))
-                
-                # Combine side by side
-                comparison = np.hstack([base_resized, present_resized])
-                
-                # Add labels
-                cv2.putText(comparison, 'BASE', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-                cv2.putText(comparison, 'PRESENT', (base_resized.shape[1] + 50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-                
-                # Add change summary
-                y_offset = 100
-                for change in change_data['changes'][:3]: # First 3 changes
-                    text = f"{change['element']}: {change['type']}"
-                    cv2.putText(comparison, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    y_offset += 30
-                
-                # Save
-                output_path = f"{output_folder}/comparison_frame_{frame_id:04d}.jpg"
-                cv2.imwrite(output_path, comparison)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        pbar = tqdm(total=max(1, total_frames), desc=f"Extracting (OpenCV) {Path(video_path).name}", leave=False)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if idx % skip == 0:
+                frame_resized = cv2.resize(frame, (640, 640))
+                out_path = output_folder / f"frame_{saved:05d}.jpg"
+                cv2.imwrite(str(out_path), frame_resized)
+                frames.append(str(out_path))
                 saved += 1
-            except Exception as e:
-                print(f"\n   [WARNING] Error creating comparison for frame {frame_id}: {e}")
-        
-        print(f"   [SUCCESS] Saved {saved} comparison images to {output_folder}/")
-    
-    def _create_aggregate_summary(self, analysis_results):
-        """
-        Create aggregate summary
-        FIX (V9.7): Added 'total_vru'
-        """
-        summary = {
-            'total_potholes': 0, 'total_cracks': 0, 'total_road_signs': 0,
-            'total_traffic_lights': 0, 'total_furniture': 0, 'total_vru': 0,
-            'pavement_scores': [], 'marking_scores': []
-        }
-        
-        if not analysis_results: return summary
-        
-        for frame in analysis_results:
-            summary['total_potholes'] += len(frame.get('potholes', []))
-            summary['total_cracks'] += len(frame.get('cracks', []))
-            summary['total_road_signs'] += len(frame.get('road_signs', []))
-            summary['total_traffic_lights'] += len(frame.get('traffic_lights', []))
-            summary['total_furniture'] += len(frame.get('furniture', []))
-            summary['total_vru'] += len(frame.get('vru', [])) # <-- NEW V9.7
-            
-            pavement = frame.get('pavement', {})
-            if pavement and 'score' in pavement:
-                summary['pavement_scores'].append(pavement['score'])
-            
-            markings = frame.get('markings', {})
-            if markings and 'score' in markings:
-                summary['marking_scores'].append(markings['score'])
-        
-        summary['avg_pavement_score'] = np.mean(summary['pavement_scores']) if summary['pavement_scores'] else 0
-        summary['avg_marking_score'] = np.mean(summary['marking_scores']) if summary['marking_scores'] else 0
-        
-        return summary
-    
-    def _generate_report(self, base_results, present_results, 
-                           base_metadata, present_metadata, 
-                           frame_level_changes, fps):
-        """
-        Generate comprehensive report
-        FIX (V9.7): Added 'vru' to comparison
-        """
-        
-        print("   Calculating summaries...")
-        base_summary = self._create_aggregate_summary(base_results)
-        present_summary = self._create_aggregate_summary(present_results)
-        
-        print("   Comparing aggregates...")
-        comparison = {
-            'potholes': {
-                'base': base_summary['total_potholes'],
-                'present': present_summary['total_potholes'],
-                'change': present_summary['total_potholes'] - base_summary['total_potholes']
-            },
-            'cracks': {
-                'base': base_summary['total_cracks'],
-                'present': present_summary['total_cracks'],
-                'change': present_summary['total_cracks'] - base_summary['total_cracks']
-            },
-            'pavement_condition': {
-                'base': base_summary['avg_pavement_score'],
-                'present': present_summary['avg_pavement_score'],
-                'change': present_summary['avg_pavement_score'] - base_summary['avg_pavement_score']
-            },
-            'marking_condition': {
-                'base': base_summary['avg_marking_score'],
-                'present': present_summary['avg_marking_score'],
-                'change': present_summary['avg_marking_score'] - base_summary['avg_marking_score']
-            },
-            'road_signs': {
-                'base': base_summary['total_road_signs'],
-                'present': present_summary['total_road_signs'],
-                'change': present_summary['total_road_signs'] - base_summary['total_road_signs']
-            },
-            'traffic_lights': {
-                'base': base_summary['total_traffic_lights'],
-                'present': present_summary['total_traffic_lights'],
-                'change': present_summary['total_traffic_lights'] - base_summary['total_traffic_lights']
-            },
-            'furniture': {
-                'base': base_summary['total_furniture'],
-                'present': present_summary['total_furniture'],
-                'change': present_summary['total_furniture'] - base_summary['total_furniture']
-            },
-            'vru': {
-                'base': base_summary['total_vru'],
-                'present': present_summary['total_vru'],
-                'change': present_summary['total_vru'] - base_summary['total_vru']
-            }
-        }
-        
-        # Count issues by severity
-        issue_counts = {'high': 0, 'medium': 0, 'low': 0}
-        for change in frame_level_changes:
-            for item in change['changes']:
-                severity = item.get('severity', 'low')
-                issue_counts[severity] += 1
-        
-        return {
-            'audit_date': datetime.now().isoformat(),
-            'system_version': 'Enhanced V9.9.2',
-            'configuration': self.config,
-            'models_used': {
-                'pretrained_yolo': self.config['pretrained_model'],
-                'finetuned_model': self.config['finetuned_model'] if self.use_finetuned else 'None',
-                'traditional_cv': f'Enabled @ {self.proc_height}p'
-            },
-            'base_video': base_metadata,
-            'present_video': present_metadata,
-            'frames_analyzed': {
-                'base': len(base_results),
-                'present': len(present_results)
-            },
-            'aggregate_comparison': comparison,
-            'frame_level_changes': frame_level_changes,
-            'total_frames_with_changes': len(frame_level_changes),
-            'issue_summary': {
-                'total_issues': sum(issue_counts.values()),
-                'by_severity': issue_counts
-            },
-            'base_summary': base_summary,
-            'present_summary': present_summary,
-            'quality_metrics': {
-                'confidence_threshold': self.min_confidence,
-                'nms_applied': True,
-                'duplicate_removal': 'Active (10s cooldown)', # Updated from 2s
-                'guardrail_filter': 'Active',
-                'deterioration_logic': 'Strike System (n=5)'
-            }
-        }
-    
-    def _print_summary(self, report):
-        """
-        Print comprehensive summary
-        FIX (V9.7): Added 'VRUs'
-        """
-        print("\n" + "="*70)
-        print(" ENHANCED AUDIT SUMMARY (V9.9.2)")
-        print("="*70)
-        
-        comp = report['aggregate_comparison']
-        
-        def arrow(change):
-            if change > 0: return "+"
-            if change < 0: return "-"
-            return " "
-        
-        print("\n[INFO] AGGREGATE COMPARISON")
-        print(f"\n   Potholes:       {comp['potholes']['base']} -> {comp['potholes']['present']} "
-              f"({arrow(comp['potholes']['change'])}{abs(comp['potholes']['change'])})")
-        
-        print(f"   Cracks:         {comp['cracks']['base']} -> {comp['cracks']['present']} "
-              f"({arrow(comp['cracks']['change'])}{abs(comp['cracks']['change'])})")
-        
-        print(f"\n   Pavement:       {comp['pavement_condition']['base']:.1f} -> "
-              f"{comp['pavement_condition']['present']:.1f} "
-              f"({arrow(comp['pavement_condition']['change'])} "
-              f"{abs(comp['pavement_condition']['change']):.1f})")
-        
-        print(f"   Markings:       {comp['marking_condition']['base']:.1f} -> "
-              f"{comp['marking_condition']['present']:.1f} "
-              f"({arrow(comp['marking_condition']['change'])} "
-              f"{abs(comp['marking_condition']['change']):.1f})")
-        
-        print(f"\n   Signs:          {comp['road_signs']['base']} -> {comp['road_signs']['present']} "
-              f"({arrow(comp['road_signs']['change'])}{abs(comp['road_signs']['change'])})")
-        
-        print(f"   Traffic Lights: {comp['traffic_lights']['base']} -> {comp['traffic_lights']['present']} "
-              f"({arrow(comp['traffic_lights']['change'])}{abs(comp['traffic_lights']['change'])})")
+            idx += 1
+            pbar.update(1)
+        pbar.close()
+        cap.release()
+        return frames
 
-        print(f"   Furniture:      {comp['furniture']['base']} -> {comp['furniture']['present']} "
-              f"({arrow(comp['furniture']['change'])}{abs(comp['furniture']['change'])})")
-        
-        print(f"   VRUs:           {comp['vru']['base']} -> {comp['vru']['present']} "
-              f"({arrow(comp['vru']['change'])}{abs(comp['vru']['change'])})")
-        
-        print(f"\n[INFO] FRAME-LEVEL CHANGES")
-        print(f"   Frames with changes: {report['total_frames_with_changes']}")
-        print(f"   Total issues: {report['issue_summary']['total_issues']}")
-        
-        severity = report['issue_summary']['by_severity']
-        print(f"\n[INFO] BY SEVERITY")
-        print(f"   High:     {severity['high']}")
-        print(f"   Medium:   {severity['medium']}")
-        print(f"   Low:      {severity['low']}")
-        
-        print(f"\n[INFO] QUALITY ASSURANCE")
-        qm = report['quality_metrics']
-        print(f"   Confidence threshold: {qm['confidence_threshold']}")
-        print(f"   NMS (duplicate removal): {qm['nms_applied']}")
-        print(f"   Frame-level tracking: {qm['duplicate_removal']}")
-        print(f"   Guardrail Filter: {qm['guardrail_filter']}")
-        print(f"   Deterioration Logic: {qm['deterioration_logic']}")
-        
-        print("\n" + "="*70)
-    
-    def run_complete_audit(self, base_video, present_video):
-        """Run complete enhanced audit"""
-        print("\n" + "="*70)
-        print(" STARTING ENHANCED AUDIT")
-        print("="*70)
-        
-        # Reset strike counters for a new run
-        self.strike_counters = {'pavement': 0, 'markings': 0}
+    # ----------------- collate frame results -----------------
+    def _collate_frame_results(self, frame_path, custom_result, seg_result_unused, gis_profile, frame_idx):
+        img = cv2.imread(frame_path)
+        if img is None:
+            self._log(f"[FRAME][WARN] Could not read frame image: {frame_path}")
+            return None
 
-        fps = self.config['fps']
-        batch_size = self.config['batch_size']
-        
-        print("\n[STEP 0/5] Validating videos...")
-        base_metadata = self.extract_video_metadata(base_video)
-        present_metadata = self.extract_video_metadata(present_video)
-        
-        if not self.validate_video_compatibility(base_metadata, present_metadata):
-            print("\n[ERROR] Validation failed. Aborting.")
-            return None
-        
-        print("\n[STEP 1/5] Extracting frames...")
-        base_frames = self.extract_frames(base_video, 'data/base_frames', fps=fps)
-        present_frames = self.extract_frames(present_video, 'data/present_frames', fps=fps)
-        
-        if not base_frames or not present_frames:
-            print("[ERROR] Frame extraction failed")
-            return None
-        
-        print("\n[STEP 2/5] Analyzing BASE video...")
-        base_results = self._run_analysis_pipeline(base_frames, batch_size=batch_size)
-        
-        print("\n[STEP 3/5] Analyzing PRESENT video...")
-        present_results = self._run_analysis_pipeline(present_frames, batch_size=batch_size)
-        
-        print("\n[STEP 4/5] Performing comparisons...")
-        frame_level_changes = self._compare_frame_by_frame(base_results, present_results, fps)
-        
-        print(f"   [SUCCESS] Found changes in {len(frame_level_changes)} frames")
-        
-        if frame_level_changes:
-            self.save_comparison_images(base_results, present_results, frame_level_changes)
-        
-        print("\n[STEP 5/5] Generating report...")
-        report = self._generate_report(
-            base_results, present_results, base_metadata,
-            present_metadata, frame_level_changes, fps
+        self.pci_stats["total_frames"] += 1
+
+        markings_info, marking_dets = self._analyze_markings(img)
+
+        frame_data = {
+            "frame": frame_path,
+            "frame_idx": frame_idx,
+            "gis_profile": gis_profile,
+            "potholes": [],
+            "cracks": [],
+            "road_signs": [],
+            "traffic_lights": [],
+            "furniture": [],
+            "markings": markings_info,
+            "marking_detections": marking_dets,
+        }
+
+        if markings_info["marking_wear_pct"] > 50:
+            self.pci_stats["faded_marks"] += 1
+
+        if custom_result is not None and getattr(custom_result, "boxes", None) is not None:
+            for box in custom_result.boxes:
+                try:
+                    conf = float(box.conf[0])
+                except Exception:
+                    conf = float(getattr(box, "conf", 0) or 0)
+                if conf < self.config["min_confidence"]:
+                    continue
+
+                try:
+                    cls_idx = int(box.cls[0])
+                    raw_label = str(self.custom_model.names.get(cls_idx, f"class_{cls_idx}"))
+                except Exception:
+                    raw_label = str(getattr(box, "cls", "unknown"))
+
+                try:
+                    bbox = box.xyxy[0].tolist()
+                except Exception:
+                    bbox = [0, 0, 0, 0]
+
+                det = {"label": raw_label, "confidence": conf, "bbox": bbox, "occluded": False}
+                lower = raw_label.lower()
+
+                # guardrail occlusion
+                if "guardrail" in lower or "guard rail" in lower:
+                    occluded, veg_frac = self._is_guardrail_occluded_by_vegetation(img, bbox)
+                    if occluded:
+                        det["occluded"] = True
+                        det["occlusion_vegetation_fraction"] = float(veg_frac)
+                        key = f"guardrail::{int(bbox[0])}_{int(bbox[1])}_{int(bbox[2])}_{int(bbox[3])}"
+                        state = self.occlusion_state.get(key, {"occluded_frames": 0, "last_seen_frame": frame_idx})
+                        state["last_seen_frame"] = frame_idx
+                        state["occluded_frames"] = state.get("occluded_frames", 0) + 1
+                        self.occlusion_state[key] = state
+                    else:
+                        key = f"guardrail::{int(bbox[0])}_{int(bbox[1])}_{int(bbox[2])}_{int(bbox[3])}"
+                        if key in self.occlusion_state:
+                            self.occlusion_state[key]["occluded_frames"] = 0
+                            self.occlusion_state[key]["last_seen_frame"] = frame_idx
+
+                # potholes
+                if "pothole" in lower:
+                    det["root_cause"] = self.rca.determine_cause("pothole", {}, gis_profile)
+                    frame_data["potholes"].append(det)
+                    self.pci_stats["potholes"] += 1
+
+                # cracks
+                elif "crack" in lower:
+                    width_px = self._measure_crack_width_px(img, bbox)
+                    width_cm = width_px * self.pixel_to_cm_scale
+                    det["width_px"] = width_px
+                    det["width_cm"] = width_cm
+                    metrics = {"crack_width_cm": width_cm}
+                    det["root_cause"] = self.rca.determine_cause("crack", metrics, gis_profile)
+                    frame_data["cracks"].append(det)
+                    self.pci_stats["crack_len_px"] += width_px
+
+                # speed breakers
+                elif "speed" in lower and "breaker" in lower:
+                    frame_data["furniture"].append(det)
+
+                # signs
+                elif "sign" in lower:
+                    det["root_cause"] = self.rca.determine_cause("damaged_sign", {}, gis_profile)
+                    frame_data["road_signs"].append(det)
+
+                # traffic lights
+                elif "trafficlight" in lower or "signal" in lower:
+                    frame_data["traffic_lights"].append(det)
+
+                # street lights
+                elif "streetlight" in lower:
+                    frame_data["furniture"].append(det)
+
+                # guardrails
+                elif "guardrail" in lower:
+                    det["root_cause"] = self.rca.determine_cause("broken_guardrail", {}, gis_profile)
+                    frame_data["furniture"].append(det)
+
+                else:
+                    frame_data["furniture"].append(det)
+
+        return frame_data
+
+    # ----------------- PCI calculation -----------------
+    def _calculate_pci_score(self, gis_profile=None):
+        score = 100.0
+        total_frames = max(1, self.pci_stats["total_frames"])
+        pothole_density = self.pci_stats["potholes"] / total_frames
+        avg_crack_width_px = self.pci_stats["crack_len_px"] / total_frames
+        marking_density = self.pci_stats["faded_marks"] / total_frames
+        score -= pothole_density * 40.0
+        score -= avg_crack_width_px * 0.2
+        score -= marking_density * 20.0
+        if gis_profile:
+            ctx = gis_profile.get("context", "Urban")
+            drainage = gis_profile.get("drainage_quality", "Moderate")
+            traffic_adt = gis_profile.get("traffic_density_adt", 0)
+            if ctx == "Highway":
+                score -= 2.0
+            if drainage in ["Poor", "Blocked"]:
+                score -= 3.0
+            if traffic_adt >= 10000:
+                score -= 3.0
+        score = max(0, min(100, int(score)))
+        if score >= 85:
+            rating = "Good"
+        elif score >= 70:
+            rating = "Satisfactory"
+        elif score >= 55:
+            rating = "Fair"
+        elif score >= 40:
+            rating = "Poor"
+        else:
+            rating = "Very Poor"
+        return score, rating
+
+    # ----------------- dedupe / cooldown helpers -----------------
+    def _event_key_from_change(self, event):
+        return f"{event['element']}::{event.get('type','')}".lower()
+
+    def _should_suppress_event(self, event_key, current_frame):
+        """
+        Improved suppression:
+         - If same key was seen within cooldown frames -> suppress
+         - Update last_frame and suppressed_until appropriately
+         - Keep recent_events small
+        """
+        cooldown = int(self.config.get("change_cooldown_frames", 3))
+        for ev in self.recent_events:
+            if ev["key"] == event_key:
+                # If event occurred recently (within cooldown) -> suppress
+                if (current_frame - ev.get("last_frame", -9999)) <= cooldown:
+                    # keep last_frame unchanged (still last seen)
+                    return True
+                # otherwise update last_frame and allow event
+                ev["last_frame"] = current_frame
+                return False
+
+        # new event -> record and allow
+        self.recent_events.append({"key": event_key, "last_frame": current_frame})
+        # trim
+        if len(self.recent_events) > 2000:
+            self.recent_events = self.recent_events[-1000:]
+        return False
+
+
+    # ----------------- comparison (with occlusion awareness) -----------------
+    def _compare_frame_by_frame(self, base_results, present_results, fps):
+        changes = []
+        min_len = min(len(base_results), len(present_results))
+        for i in range(min_len):
+            base = base_results[i]
+            pres = present_results[i]
+            frame_log = []
+            # pothole increase
+            if len(pres["potholes"]) > len(base["potholes"]):
+                event = {"element": "Pothole", "type": "New pothole(s) observed", "severity": "high"}
+                key = self._event_key_from_change(event)
+                if self._should_suppress_event(key, i):
+                    self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                else:
+                    frame_log.append(event)
+            # crack increase
+            if len(pres["cracks"]) > len(base["cracks"]):
+                event = {"element": "Cracks", "type": "New or widened cracks observed", "severity": "medium"}
+                key = self._event_key_from_change(event)
+                if self._should_suppress_event(key, i):
+                    self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                else:
+                    frame_log.append(event)
+            # marking wear
+            if pres["markings"]["marking_wear_pct"] > base["markings"]["marking_wear_pct"] + 20:
+                event = {"element": "Markings", "type": "Additional fading or loss of markings", "severity": "medium"}
+                key = self._event_key_from_change(event)
+                if self._should_suppress_event(key, i):
+                    self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                else:
+                    frame_log.append(event)
+            # signs missing
+            if len(pres["road_signs"]) < len(base["road_signs"]):
+                event = {"element": "Road Signs", "type": "Possible missing or damaged sign(s)", "severity": "high"}
+                key = self._event_key_from_change(event)
+                if self._should_suppress_event(key, i):
+                    self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                else:
+                    frame_log.append(event)
+            # roadside furniture (guardrail occlusion aware)
+            if len(pres["furniture"]) < len(base["furniture"]):
+                occlusion_suppressed = False
+                for b_det in base["furniture"]:
+                    if "guardrail" in b_det.get("label", "").lower():
+                        key_coords = f"guardrail::{int(b_det['bbox'][0])}_{int(b_det['bbox'][1])}_{int(b_det['bbox'][2])}_{int(b_det['bbox'][3])}"
+                        state = self.occlusion_state.get(key_coords)
+                        if state and state.get("occluded_frames", 0) >= self.config["occlusion_persistence_frames"]:
+                            occlusion_suppressed = True
+                            self.suppressed_events.append({"frame": i, "event": {"element": "Roadside Furniture", "type": "Possible missing guardrail (occluded by vegetation)"}, "reason": "occlusion"})
+                            break
+                if not occlusion_suppressed:
+                    event = {"element": "Roadside Furniture", "type": "Missing or damaged roadside asset(s)", "severity": "high"}
+                    key = self._event_key_from_change(event)
+                    if self._should_suppress_event(key, i):
+                        self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                    else:
+                        frame_log.append(event)
+            if frame_log:
+                changes.append({"frame_id": i, "timestamp_seconds": i / fps if fps > 0 else 0.0, "changes": frame_log, "base_frame": base.get("frame"), "present_frame": pres.get("frame")})
+        return changes
+
+    # ----------------- save comparison images -----------------
+    def save_comparison_images(self, base_res, pres_res, changes, output_dir=COMPARISON_DIR):
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        for c in changes:
+            fid = c["frame_id"]
+            if fid >= len(base_res) or fid >= len(pres_res):
+                continue
+            img_b = cv2.imread(base_res[fid]["frame"])
+            img_p = cv2.imread(pres_res[fid]["frame"])
+            if img_b is None or img_p is None:
+                continue
+            if img_b.shape != img_p.shape:
+                img_p = cv2.resize(img_p, (img_b.shape[1], img_b.shape[0]))
+            combined = np.hstack((img_b, img_p))
+            cv2.putText(combined, "BASE", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(combined, "PRESENT", (combined.shape[1] // 2 + 50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.imwrite(str(out / f"comp_{fid:05d}.jpg"), combined)
+
+    # ----------------- main audit -----------------
+    def run_complete_audit(self, base_path, present_path, manual_gps=None):
+        base_path = Path(base_path)
+        present_path = Path(present_path)
+
+        # Sync videos and extract frames
+        syncer = VisualSynchronizer()
+        off_b, off_p = syncer.get_sync_offsets(str(base_path), str(present_path))
+
+        base_out = PROJECT_ROOT / "data" / "base"
+        present_out = PROJECT_ROOT / "data" / "present"
+        base_out.mkdir(parents=True, exist_ok=True)
+        present_out.mkdir(parents=True, exist_ok=True)
+
+        print("[PROCESS] Extracting frames with FFmpeg/OpenCV (single pass, aligned offsets)...")
+
+        base_frames = self.extract_frames(
+            str(base_path),
+            base_out,
+            fps=self.config.get("fps", 1),
+            start_frame=int(off_b) if off_b else 0,
         )
+
+        present_frames = self.extract_frames(
+            str(present_path),
+            present_out,
+            fps=self.config.get("fps", 1),
+            start_frame=int(off_p) if off_p else 0,
+        )
+
+        if not base_frames or not present_frames:
+            self._log("[ERROR] No frames extracted from one or both videos.")
+            return {
+                "error": "Frame extraction failed for one or both videos.",
+                "logs": self.pipeline_logs,
+            }
+
+        # Get GPS
+        base_meta = self.extract_video_metadata(str(base_path))
+        gps = base_meta.get("gps_data")
+        if not gps:
+            present_meta = self.extract_video_metadata(str(present_path))
+            gps = present_meta.get("gps_data")
+        if manual_gps:
+            gps = manual_gps
+        if not gps:
+            self._log("[WARN] No GPS found; using default (New Delhi).")
+            gps = {"latitude": 28.6139, "longitude": 77.2090}
+
+        self.global_gis_profile = self.gis_engine.build_gis_profile(gps["latitude"], gps["longitude"])
+
+        # ==================== PROCESS BASE VIDEO ====================
+        print("\n[PROCESS] Analyzing base video frames...")
+        self.pci_stats = self._reset_pci_stats()  # FIX: Use method
+        base_results = []
         
-        Path('results').mkdir(exist_ok=True)
-        report_path = 'results/audit_report_v9_enhanced.json'
-        with open(report_path, 'w') as f:
-            json.dump(report, f, indent=2)
+        for idx, f in enumerate(tqdm(base_frames, desc="AI Processing (Base)")):
+            img = cv2.imread(f)
+            if img is None:
+                self._log(f"[BASE][WARN] Skipping unreadable frame: {f}")
+                continue
+            try:
+                custom_res = self.custom_model(img, verbose=False, device=self.device)[0]
+            except Exception as e:
+                self._log(f"[BASE][ERROR] Custom model inference failed on {f}: {e}")
+                continue
+            frame_data = self._collate_frame_results(f, custom_res, None, self.global_gis_profile, idx)
+            if frame_data:
+                base_results.append(frame_data)
+
+        # Calculate base PCI and SAVE stats before reset
+        base_pci_score, base_pci_rating = self._calculate_pci_score(self.global_gis_profile)
+        base_pci_stats = self.pci_stats.copy()  # FIX: Save stats!
         
-        print(f"[SUCCESS] Report saved: {report_path}")
+        # ==================== PROCESS PRESENT VIDEO ====================
+        print("\n[PROCESS] Analyzing present video frames...")
+        self.pci_stats = self._reset_pci_stats()  # FIX: Fresh stats for present
+        present_results = []
         
-        self._print_summary(report)
-        
+        for idx, f in enumerate(tqdm(present_frames, desc="AI Processing (Present)")):
+            img = cv2.imread(f)
+            if img is None:
+                self._log(f"[PRESENT][WARN] Skipping unreadable frame: {f}")
+                continue
+            try:
+                custom_res = self.custom_model(img, verbose=False, device=self.device)[0]
+            except Exception as e:
+                self._log(f"[PRESENT][ERROR] Custom model inference failed on {f}: {e}")
+                continue
+            frame_data = self._collate_frame_results(f, custom_res, None, self.global_gis_profile, idx)
+            if frame_data:
+                present_results.append(frame_data)
+
+        present_pci_score, present_pci_rating = self._calculate_pci_score(self.global_gis_profile)
+        present_pci_stats = self.pci_stats.copy()  # FIX: Save stats!
+
+        # Compare
+        print("\n[PROCESS] Comparing frame-by-frame deterioration...")
+        changes = self._compare_frame_by_frame(base_results, present_results, self.config["fps"])
+
+        # Save comparison images
+        self.save_comparison_images(base_results, present_results, changes)
+
+        # Aggregate stats
+        agg = {
+            "potholes": {
+                "base": sum(len(r["potholes"]) for r in base_results), 
+                "present": sum(len(r["potholes"]) for r in present_results)
+            },
+            "cracks": {
+                "base": sum(len(r["cracks"]) for r in base_results), 
+                "present": sum(len(r["cracks"]) for r in present_results)
+            },
+            "faded_marking_frames": {
+                "base": sum(1 for r in base_results if r["markings"]["marking_wear_pct"] > 50), 
+                "present": sum(1 for r in present_results if r["markings"]["marking_wear_pct"] > 50)
+            },
+        }
+        agg["potholes"]["delta"] = agg["potholes"]["present"] - agg["potholes"]["base"]
+        agg["cracks"]["delta"] = agg["cracks"]["present"] - agg["cracks"]["base"]
+        agg["faded_marking_frames"]["delta"] = agg["faded_marking_frames"]["present"] - agg["faded_marking_frames"]["base"]
+
+        # Build final report
+        report = {
+            "audit_date": datetime.now().isoformat(),
+            "gps": gps,
+            "gis_profile": self.global_gis_profile,
+            "frames_analyzed": {
+                "base": len(base_results),
+                "present": len(present_results)
+            },
+            "pci_data": {
+                "base": {"score": int(base_pci_score), "rating": str(base_pci_rating)},
+                "present": {"score": int(present_pci_score), "rating": str(present_pci_rating)},
+                "delta": int(present_pci_score) - int(base_pci_score),
+            },
+            "pci_stats": {
+                "base": base_pci_stats,
+                "present": present_pci_stats,
+            },
+            "aggregate_comparison": agg,
+            "frame_level_changes": changes,
+            "base_frame_data": base_results,
+            "present_frame_data": present_results,
+            "logs": self.pipeline_logs,
+            "suppressed_events": self.suppressed_events,
+        }
+
+        # Save JSON
+        try:
+            outp = RESULTS_DIR / "audit_output.json"
+            with open(outp, "w", encoding="utf-8") as fh:
+                json.dump(report, fh, indent=2, ensure_ascii=False)
+            print(f"[OK] Audit JSON saved: {outp}")
+        except Exception as e:
+            self._log(f"[SAVE][WARN] Failed to write audit_output.json: {e}")
+
         return report
+# EOF

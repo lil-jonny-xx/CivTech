@@ -1,195 +1,408 @@
 """
-LaTeX PDF Report Generator
-
-FIXES (V9.7.2):
-- CRITICAL FIX: Removed aggressive colon-escaping (.replace(':', ':\\'))
-  that caused 'Undefined control sequence' crash.
-- FORMAT FIX: Narrowed longtable columns to fix 'Overfull \hbox' warning.
-- Added 'VRUs' to the summary table.
-
-This is an updated file. Save as: latex_report_generator.py
+latex_report_generator.py — FIXED VERSION WITH PROPER REGENERATION
+-------------------------------------------------------------------
+Ensures fresh PDF generation every time with proper cleanup.
 """
+
 import json
 from pathlib import Path
+import subprocess
+from datetime import datetime
+import glob
+import shutil
+
 
 class LatexReportGenerator:
-    """Generates a .tex file from audit data."""
+    def __init__(self, audit_json, irc_json=None):
+        self.audit_json = Path(audit_json)
+        if not self.audit_json.exists():
+            raise FileNotFoundError(f"Audit JSON missing: {audit_json}")
 
-    def __init__(self, report_data, irc_solutions):
-        self.report = report_data
-        self.solutions = irc_solutions
-        self.tex_lines = []
-
-    def _write_header(self):
-        """Writes the LaTeX preamble."""
-        self.tex_lines = [
-            "\\documentclass[11pt, a4paper]{article}",
-            "\\usepackage[utf8]{inputenc}",
-            "\\usepackage[T1]{fontenc}",
-            "\\usepackage[a4paper, top=2.5cm, bottom=2.5cm, left=2cm, right=2cm]{geometry}",
-            "\\usepackage{graphicx}",
-            "\\usepackage{booktabs}",
-            "\\usepackage{longtable}",
-            "\\usepackage{xcolor}",
-            "\\usepackage{hyperref}",
-            "\\hypersetup{colorlinks=true, urlcolor=blue, linkcolor=black}",
-            "",
-            "\\title{Road Safety Audit Report V9.7}",
-            "\\author{Automated Analysis System}",
-            f"\\date{{{self.report.get('audit_date', '')}}}",
-            "",
-            "\\begin{document}",
-            "",
-            "\\maketitle",
-        ]
-
-    def _write_summary(self):
-        """Writes the main summary tables."""
-        self.tex_lines.append("\\section{Executive Summary}")
-        self.tex_lines.append("This report details the findings of an automated comparative road audit.")
-        
-        comp = self.report.get('aggregate_comparison', {})
-        self.tex_lines.extend([
-            "\\subsection{Aggregate Comparison}",
-            "\\begin{tabular}{lrrrr}",
-            "\\toprule",
-            "\\textbf{Metric} & \\textbf{Base} & \\textbf{Present} & \\textbf{Change} \\\\",
-            "\\midrule",
-        ])
-        
-        # Helper to format table rows
-        def add_row(metric, key, is_score=False):
-            data = comp.get(key, {})
-            base = data.get('base', 0)
-            present = data.get('present', 0)
-            change = data.get('change', 0)
-            if is_score:
-                self.tex_lines.append(f"{metric} & {base:.1f} & {present:.1f} & {change:+.1f} \\\\")
-            else:
-                self.tex_lines.append(f"{metric} & {base} & {present} & {change:+} \\\\")
-
-        add_row("Potholes", 'potholes')
-        add_row("Cracks", 'cracks')
-        add_row("Road Signs", 'road_signs')
-        add_row("Traffic Lights", 'traffic_lights')
-        add_row("Road Furniture", 'furniture')
-        add_row("VRUs", 'vru') # <-- NEW V9.7
-        add_row("Pavement Score", 'pavement_condition', is_score=True)
-        add_row("Marking Score", 'marking_condition', is_score=True)
-
-        self.tex_lines.extend([
-            "\\bottomrule",
-            "\\end{tabular}",
-            "",
-            "\\subsection{Issue Summary by Severity}",
-            "\\begin{tabular}{lr}",
-            "\\toprule",
-            "\\textbf{Severity} & \\textbf{Total Issues} \\\\",
-            "\\midrule",
-        ])
-        
-        issues = self.report.get('issue_summary', {}).get('by_severity', {})
-        self.tex_lines.append(f"\\textcolor{{red!70!black}}{{High}} & {issues.get('high', 0)} \\\\")
-        self.tex_lines.append(f"\\textcolor{{orange!90!black}}{{Medium}} & {issues.get('medium', 0)} \\\\")
-        self.tex_lines.append(f"\\textcolor{{yellow!80!black}}{{Low}} & {issues.get('low', 0)} \\\\")
-        self.tex_lines.append(f"\\midrule")
-        self.tex_lines.append(f"\\textbf{{Total}} & \\textbf{{{self.report.get('issue_summary', {}).get('total_issues', 0)}}} \\\\")
-        self.tex_lines.extend([
-            "\\bottomrule",
-            "\\end{tabular}",
-            "",
-        ])
-
-    def _write_irc_solutions(self):
-        """Writes the IRC solutions table."""
-        self.tex_lines.append("\\section{Recommended Interventions (IRC Standards)}")
-        
-        # --- FORMATTING FIX: Column 2 width changed from 0.55 to 0.50 ---
-        self.tex_lines.extend([
-            "\\begin{longtable}{p{0.15\\textwidth} p{0.50\\textwidth} p{0.25\\textwidth}}",
-            "\\toprule",
-            "\\textbf{Priority} & \\textbf{Recommendation} & \\textbf{Reference} \\\\",
-            "\\midrule",
-            "\\endfirsthead",
-            "\\toprule",
-            "\\textbf{Priority} & \\textbf{Recommendation} & \\textbf{Reference} \\\\",
-            "\\midrule",
-            "\\endhead",
-            "\\bottomrule",
-            "\\endfoot",
-        ])
-        
-        for s in self.solutions:
-            priority = s.get('priority', 'N/A')
-            if 'P1' in priority or 'Critical' in priority:
-                priority = f"\\textcolor{{red!70!black}}{{{priority}}}"
-            elif 'P2' in priority or 'Urgent' in priority:
-                priority = f"\\textcolor{{red!80!black}}{{{priority}}}"
-            elif 'P3' in priority or 'Warning' in priority:
-                priority = f"\\textcolor{{orange!90!black}}{{{priority}}}"
-            
-            # --- CRASH FIX: Removed .replace(':', ':\\') from 'rec' variable ---
-            rec = s.get('recommendation', 'N/A').replace('_', '\\_')
-            ref = s.get('reference', 'N/A').replace('_', '\\_')
-            
-            self.tex_lines.append(f"{priority} & {rec} & {ref} \\\\")
-            
-        self.tex_lines.append("\\end{longtable}")
-        self.tex_lines.append("")
-
-
-    def _write_visuals(self):
-        """Writes the section for visual comparisons."""
-        self.tex_lines.append("\\section{Visual Evidence (Top Changes)}")
-        self.tex_lines.append(
-            "Visual comparisons for the top 10 most significant changes detected. "
-            "Base video on the left, present video on the right."
-        )
-        self.tex_lines.append("")
-
-        comp_dir = Path("results/comparisons")
-        if comp_dir.exists():
-            images = sorted(list(comp_dir.glob("*.jpg")))
-            if not images:
-                self.tex_lines.append("No comparison images found or generated.")
-                return
-
-            for img_path in images:
-                # Use relative path and escape spaces
-                rel_path = f"results/comparisons/{img_path.name}"
-                rel_path = rel_path.replace(" ", "\\ ")
-                
-                # Clean up caption
-                caption = img_path.stem.replace('_', ' ').replace(' ', ' ')
-                
-                self.tex_lines.extend([
-                    "\\begin{figure}[h!]",
-                    "  \\centering",
-                    f"  \\includegraphics[width=0.9\\textwidth]{{{rel_path}}}",
-                    f"  \\caption{{Visual comparison for {caption}}}",
-                    "\\end{figure}",
-                    "\\clearpage",
-                ])
+        if irc_json and Path(irc_json).exists():
+            self.irc_json = Path(irc_json)
         else:
-            self.tex_lines.append("Comparison image directory not found.")
-            
-    def _write_footer(self):
-        """Closes the document."""
-        self.tex_lines.append("\\end{document}")
+            self.irc_json = None
 
-    def generate_tex(self, output_path="final_audit_report.tex"):
-        """Generates the full .tex file."""
-        print(f"\n   Generating LaTeX report: {output_path}")
-        self.tex_lines = [] # Clear previous lines
-        self._write_header()
-        self._write_summary()
-        self._write_irc_solutions()
-        self._write_visuals()
-        self._write_footer()
+        # Load audit JSON
+        with open(self.audit_json, "r", encoding="utf-8") as f:
+            self.audit = json.load(f)
+
+        # Load IRC JSON
+        if self.irc_json:
+            with open(self.irc_json, "r", encoding="utf-8") as f:
+                self.irc = json.load(f)
+        else:
+            self.irc = {"recommendations": [], "priority_summary": {}}
+
+        self.output_dir = Path("results")
+        self.output_dir.mkdir(exist_ok=True)
+
+        # Use timestamp to ensure uniqueness
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.tex_path = self.output_dir / "report.tex"
+        self.pdf_path = self.output_dir / "report.pdf"
+
+    def _cleanup_old_files(self):
+        """Remove old LaTeX auxiliary files and PDF - with verification"""
+        patterns = ["report.*"]
+        failed_deletes = []
         
+        for pattern in patterns:
+            for f in self.output_dir.glob(pattern):
+                if not f.is_file():
+                    continue
+                
+                # Try multiple times (Windows file locks)
+                deleted = False
+                for attempt in range(3):
+                    try:
+                        f.unlink()
+                        deleted = True
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            failed_deletes.append((str(f), str(e)))
+                        import time
+                        time.sleep(0.1)
+        
+        if failed_deletes:
+            print("[LaTeX][WARN] Could not delete some files:")
+            for fname, error in failed_deletes:
+                print(f"  - {fname}: {error}")
+            print("[LaTeX] This may cause PDF regeneration issues.")
+
+    def _escape(self, text):
+        """Properly escape LaTeX special characters"""
+        if text is None:
+            return ""
+        if not isinstance(text, str):
+            text = str(text)
+        
+        # Replace in specific order to avoid double-escaping
+        replacements = [
+            ("\\", "\\textbackslash{}"),
+            ("{", "\\{"),
+            ("}", "\\}"),
+            ("$", "\\$"),
+            ("&", "\\&"),
+            ("%", "\\%"),
+            ("_", "\\_"),
+            ("#", "\\#"),
+            ("~", "\\textasciitilde{}"),
+            ("^", "\\textasciicircum{}"),
+        ]
+        
+        for old, new in replacements:
+            text = text.replace(old, new)
+        
+        return text
+
+    def _latex_image_block(self):
+        """Embed comparison images"""
+        out = ""
+        comparison_dir = Path("results/comparisons")
+        
+        if not comparison_dir.exists():
+            return "\\textit{No comparison images found.}\n"
+        
+        images = sorted(comparison_dir.glob("comp_*.jpg"))
+
+        if not images:
+            return "\\textit{No comparison images found.}\n"
+
+        # Limit to 30 images to keep PDF reasonable
+        for img in images[:30]:
+            # Convert to relative path from results/ directory and normalize
+            try:
+                # Get path relative to results directory
+                img_rel = img.relative_to(self.output_dir.parent)
+                # Use forward slashes for LaTeX (works on Windows and Unix)
+                img_path = str(img_rel).replace("\\", "/")
+            except ValueError:
+                # Fallback if relative path fails
+                img_path = str(img).replace("\\", "/")
+            
+            out += (
+                "\\begin{figure}[h!]\n"
+                "\\centering\n"
+                f"\\includegraphics[width=0.92\\textwidth]{{{img_path}}}\n"
+                "\\caption{Before/After Comparison}\n"
+                "\\end{figure}\n"
+                "\\clearpage\n\n"
+            )
+
+        return out
+
+    def build_tex(self):
+        """Build complete LaTeX document"""
+        gps = self.audit.get("gps", {})
+        pci = self.audit.get("pci_data", {})
+        gis = self.audit.get("gis_profile", {})
+        agg = self.audit.get("aggregate_comparison", {})
+        irc_recs = self.irc.get("recommendations", [])
+        priority_summary = self.irc.get("priority_summary", {})
+        
+        # Get current timestamp
+        report_date = datetime.now().strftime("%d %B %Y, %H:%M:%S")
+
+        # Document preamble
+        tex = r"""\documentclass[11pt,a4paper]{article}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{geometry}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{float}
+\geometry{margin=0.8in}
+
+\begin{document}
+
+\title{\textbf{Road Safety Audit Report}}
+\author{Automated Road Audit System}
+\date{""" + report_date + r"""}
+\maketitle
+
+\tableofcontents
+\clearpage
+
+"""
+
+        # GPS Location Section
+        tex += r"""
+\section{GPS Location}
+\begin{tabular}{ll}
+\textbf{Latitude:} & """ + self._escape(str(gps.get("latitude", "N/A"))) + r""" \\
+\textbf{Longitude:} & """ + self._escape(str(gps.get("longitude", "N/A"))) + r""" \\
+\end{tabular}
+
+"""
+
+        # GIS Profile Section
+        tex += r"""
+\section{GIS Profile}
+"""
+        if gis:
+            tex += r"""\begin{longtable}{|l|p{10cm}|}
+\hline
+\textbf{Attribute} & \textbf{Value} \\ \hline
+\endhead
+"""
+            for k, v in gis.items():
+                tex += f"{self._escape(k.replace('_', ' ').title())} & {self._escape(str(v))} \\\\ \\hline\n"
+            tex += "\\end{longtable}\n\n"
+        else:
+            tex += "\\textit{No GIS profile data available.}\n\n"
+
+        # PCI Section
+        tex += r"""
+\section{Pavement Condition Index (PCI)}
+"""
+        base_pci = pci.get("base", {})
+        pres_pci = pci.get("present", {})
+        delta_pci = pci.get("delta", 0)
+        
+        tex += r"""\begin{tabular}{|l|l|}
+\hline
+\textbf{Metric} & \textbf{Value} \\ \hline
+Base PCI Score & """ + str(base_pci.get("score", "-")) + r""" \\
+Base Rating & """ + self._escape(str(base_pci.get("rating", "-"))) + r""" \\ \hline
+Present PCI Score & """ + str(pres_pci.get("score", "-")) + r""" \\
+Present Rating & """ + self._escape(str(pres_pci.get("rating", "-"))) + r""" \\ \hline
+\textbf{Delta (Change)} & \textbf{""" + str(delta_pci) + r"""} \\ \hline
+\end{tabular}
+
+"""
+
+        # Aggregate Comparison
+        tex += r"""
+\section{Aggregate Defect Comparison}
+"""
+        if agg:
+            tex += r"""\begin{longtable}{|l|c|c|c|}
+\hline
+\textbf{Defect Type} & \textbf{Base} & \textbf{Present} & \textbf{Delta} \\ \hline
+\endhead
+"""
+            for defect_name, counts in agg.items():
+                label = self._escape(defect_name.replace("_", " ").title())
+                base_val = counts.get("base", 0)
+                pres_val = counts.get("present", 0)
+                delta_val = counts.get("delta", 0)
+                tex += f"{label} & {base_val} & {pres_val} & {delta_val} \\\\ \\hline\n"
+            tex += "\\end{longtable}\n\n"
+        else:
+            tex += "\\textit{No aggregate comparison data available.}\n\n"
+
+        # IRC Recommendations
+        tex += r"""
+\section{IRC Maintenance Recommendations}
+"""
+        if irc_recs:
+            tex += r"""\begin{longtable}{|p{3cm}|p{2cm}|p{1.8cm}|p{7cm}|}
+\hline
+\textbf{Issue} & \textbf{Severity} & \textbf{Priority} & \textbf{Suggested Actions} \\ \hline
+\endhead
+"""
+            for rec in irc_recs:
+                issue = self._escape(rec.get("issue", ""))
+                severity = self._escape(rec.get("severity", ""))
+                priority = self._escape(rec.get("priority", ""))
+                
+                actions = rec.get("suggested_actions", [])
+                actions_text = " \\newline ".join([self._escape(a) for a in actions])
+                
+                tex += f"{issue} & {severity} & {priority} & {actions_text} \\\\ \\hline\n"
+            
+            tex += "\\end{longtable}\n\n"
+        else:
+            tex += "\\textit{No IRC recommendations available.}\n\n"
+
+        # Priority Summary
+        tex += r"""
+\section{Maintenance Priority Summary}
+"""
+        if priority_summary:
+            counts = priority_summary.get("counts", {})
+            tex += r"""\begin{tabular}{|l|c|}
+\hline
+\textbf{Priority Level} & \textbf{Count} \\ \hline
+Overall Priority & """ + self._escape(str(priority_summary.get("overall_priority", "N/A"))) + r""" \\ \hline
+High Priority Items & """ + str(counts.get("High", 0)) + r""" \\ \hline
+Medium Priority Items & """ + str(counts.get("Medium", 0)) + r""" \\ \hline
+Low Priority Items & """ + str(counts.get("Low", 0)) + r""" \\ \hline
+\end{tabular}
+
+"""
+        else:
+            tex += "\\textit{No priority summary available.}\n\n"
+
+        # Frame-level changes
+        tex += r"""
+\section{Frame-Level Deterioration Summary}
+"""
+        changes = self.audit.get("frame_level_changes", [])
+        if changes:
+            # Limit to first 100 changes for readability
+            tex += r"""\begin{longtable}{|c|c|p{9cm}|}
+\hline
+\textbf{Frame} & \textbf{Time (s)} & \textbf{Changes Detected} \\ \hline
+\endhead
+"""
+            for change in changes[:100]:
+                frame_id = change.get("frame_id", "-")
+                timestamp = round(change.get("timestamp_seconds", 0), 2)
+                
+                change_items = change.get("changes", [])
+                change_desc = " \\newline ".join([
+                    f"{self._escape(c.get('element', ''))}: {self._escape(c.get('type', ''))}"
+                    for c in change_items
+                ])
+                
+                tex += f"{frame_id} & {timestamp} & {change_desc} \\\\ \\hline\n"
+            
+            tex += "\\end{longtable}\n\n"
+        else:
+            tex += "\\textit{No frame-level deterioration detected.}\n\n"
+
+        # Comparison images
+        tex += r"""
+\section{Before/After Comparison Images}
+"""
+        tex += self._latex_image_block()
+
+        # End document
+        tex += r"""
+\end{document}
+"""
+
+        return tex
+
+    def generate(self):
+        """Generate LaTeX and compile to PDF"""
+        
+        # Clean up old files first
+        self._cleanup_old_files()
+        
+        # Build LaTeX content
+        print("[LaTeX] Building document...")
+        tex_content = self.build_tex()
+
+        # Write .tex file
+        with open(self.tex_path, "w", encoding="utf-8") as f:
+            f.write(tex_content)
+        
+        print(f"[LaTeX] Written to {self.tex_path}")
+
+        # Try to compile with pdflatex
         try:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write("\n".join(self.tex_lines))
-            print(f"   [SUCCESS] LaTeX report saved: {output_path}")
+            print("[LaTeX] Compiling PDF (this may take a moment)...")
+            
+            # Run pdflatex twice for proper cross-references
+            for run in [1, 2]:
+                result = subprocess.run(
+                    ["pdflatex", "-interaction=nonstopmode", str(self.tex_path.name)],
+                    cwd=str(self.output_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                    check=False
+                )
+                
+                if run == 1:
+                    print("[LaTeX] First pass complete")
+                else:
+                    print("[LaTeX] Second pass complete")
+            
+            # Check if PDF was created
+            if self.pdf_path.exists():
+                print(f"[LaTeX] ✅ PDF generated: {self.pdf_path}")
+                return (str(self.tex_path), str(self.pdf_path))
+            else:
+                print("[LaTeX] ⚠️ PDF not created. Check LaTeX logs.")
+                
+                # Try to show error from log
+                log_file = self.output_dir / "report.log"
+                if log_file.exists():
+                    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                        log_lines = f.readlines()
+                        # Find error lines
+                        for i, line in enumerate(log_lines):
+                            if "! " in line or "Error" in line:
+                                print(f"[LaTeX Error] {line.strip()}")
+                                if i + 1 < len(log_lines):
+                                    print(f"             {log_lines[i+1].strip()}")
+                
+                return (str(self.tex_path), None)
+                
+        except FileNotFoundError:
+            print("[LaTeX] ⚠️ pdflatex not found. Install TeX Live or MikTeX.")
+            print("[LaTeX] .tex file created, but PDF compilation skipped.")
+            return (str(self.tex_path), None)
+            
+        except subprocess.TimeoutExpired:
+            print("[LaTeX] ⚠️ Compilation timeout. Document may be too large.")
+            return (str(self.tex_path), None)
+            
         except Exception as e:
-            print(f"   [ERROR] Error saving LaTeX report: {e}")
+            print(f"[LaTeX] ⚠️ Compilation error: {e}")
+            return (str(self.tex_path), None)
+
+
+# CLI test
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python latex_report_generator.py <audit_json> [irc_json]")
+        sys.exit(1)
+    
+    audit_path = sys.argv[1]
+    irc_path = sys.argv[2] if len(sys.argv) > 2 else None
+    
+    gen = LatexReportGenerator(audit_path, irc_path)
+    tex, pdf = gen.generate()
+    
+    print(f"\nGenerated files:")
+    print(f"  LaTeX: {tex}")
+    print(f"  PDF:   {pdf or 'Not generated'}")

@@ -1,0 +1,89 @@
+{
+  "audit_date": "string (ISO 8601 timestamp)",
+  "gps": {
+    "latitude": "float",
+    "longitude": "float"
+  },
+  "gis_profile": {
+    "context": "string",
+    "traffic_density_adt": "int",
+    "heavy_vehicle_share": "float",
+    "recent_rainfall_mm": "float",
+    "drainage_quality": "string",
+    "soil_type": "string",
+    "accident_hotspot": "bool"
+  },
+  "frames_analyzed": {
+    "base": "int",
+    "present": "int"
+  },
+  "pci_data": {
+    "base": {
+      "score": "int",
+      "rating": "string"
+    },
+    "present": {
+      "score": "int",
+      "rating": "string"
+    },
+    "delta": "int"
+  },
+  "aggregate_comparison": {
+    "potholes": {
+      "base": "int",
+      "present": "int",
+      "delta": "int"
+    },
+    "cracks": {
+      "base": "int",
+      "present": "int",
+      "delta": "int"
+    },
+    "faded_marking_frames": {
+      "base": "int",
+      "present": "int",
+      "delta": "int"
+    }
+  },
+  "frame_level_changes": [
+    {
+      "frame_id": "int",
+      "timestamp_seconds": "float",
+      "changes": [
+        {
+          "element": "string",
+          "type": "string",
+          "severity": "string"
+        }
+      ],
+      "base_frame": "string (path)",
+      "present_frame": "string (path)"
+    }
+  ],
+  "base_frame_data": [
+    {
+      "frame": "string (path)",
+      "gis_profile": "object",
+      "potholes": "list",
+      "cracks": "list",
+      "road_signs": "list",
+      "traffic_lights": "list",
+      "furniture": "list",
+      "markings": "object",
+      "marking_detections": "list"
+    }
+  ],
+  "present_frame_data": [
+    {
+      "frame": "string (path)",
+      "gis_profile": "object",
+      "potholes": "list",
+      "cracks": "list",
+      "road_signs": "list",
+      "traffic_lights": "list",
+      "furniture": "list",
+      "markings": "object",
+      "marking_detections": "list"
+    }
+  ]
+}
