@@ -208,4 +208,8 @@ Ultralytics YOLO
 MiKTeX / TeXLive
 OpenCV community
 GDAL, Fiona, Rasterio maintainers
+<<<<<<< HEAD
 IRC Documentation
+=======
+IRC Documentation
+>>>>>>> 69cf25b08c997a45634a87a7a21d21342d4f6de1
