@@ -1,84 +1,80 @@
 """
-latex_report_generator.py — FIXED VERSION WITH PROPER REGENERATION
--------------------------------------------------------------------
-Ensures fresh PDF generation every time with proper cleanup.
+latex_report_generator.py - LUALATEX OPTIMIZED VERSION
+Works perfectly with LuaLaTeX (better Unicode support than pdflatex)
+
+Key improvements:
+- Optimized for lualatex specifically
+- Better error detection and reporting
+- Handles UTF-8 properly
+- Uses fontspec for modern fonts
+- Proper table formatting for large content
+- Retry logic with cleanup between runs
 """
 
 import json
-from pathlib import Path
 import subprocess
+import time
+import os
+from pathlib import Path
 from datetime import datetime
-import glob
-import shutil
 
 
 class LatexReportGenerator:
+    """
+    Generates comprehensive PDF reports using LuaLaTeX
+    Works on Windows, macOS, and Linux
+    """
+    
     def __init__(self, audit_json, irc_json=None):
         self.audit_json = Path(audit_json)
+        
         if not self.audit_json.exists():
             raise FileNotFoundError(f"Audit JSON missing: {audit_json}")
-
-        if irc_json and Path(irc_json).exists():
-            self.irc_json = Path(irc_json)
-        else:
-            self.irc_json = None
-
-        # Load audit JSON
+        
+        # Load audit data
         with open(self.audit_json, "r", encoding="utf-8") as f:
             self.audit = json.load(f)
-
-        # Load IRC JSON
-        if self.irc_json:
-            with open(self.irc_json, "r", encoding="utf-8") as f:
+        
+        # Load IRC data
+        if irc_json and Path(irc_json).exists():
+            with open(irc_json, "r", encoding="utf-8") as f:
                 self.irc = json.load(f)
         else:
             self.irc = {"recommendations": [], "priority_summary": {}}
-
-        self.output_dir = Path("results")
+        
+        self.output_dir = Path("results").absolute()
         self.output_dir.mkdir(exist_ok=True)
-
-        # Use timestamp to ensure uniqueness
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
         self.tex_path = self.output_dir / "report.tex"
         self.pdf_path = self.output_dir / "report.pdf"
-
-    def _cleanup_old_files(self):
-        """Remove old LaTeX auxiliary files and PDF - with verification"""
-        patterns = ["report.*"]
-        failed_deletes = []
+        self.log_path = self.output_dir / "report.log"
         
-        for pattern in patterns:
-            for f in self.output_dir.glob(pattern):
-                if not f.is_file():
-                    continue
-                
-                # Try multiple times (Windows file locks)
-                deleted = False
-                for attempt in range(3):
-                    try:
-                        f.unlink()
-                        deleted = True
-                        break
-                    except Exception as e:
-                        if attempt == 2:
-                            failed_deletes.append((str(f), str(e)))
-                        import time
-                        time.sleep(0.1)
+        # Intermediate files created by lualatex
+        self.aux_path = self.output_dir / "report.aux"
+        self.out_path = self.output_dir / "report.out"
+    
+    def _cleanup_files(self):
+        """Remove old PDF and intermediate files that might cause issues"""
+        files_to_remove = [self.pdf_path, self.aux_path, self.out_path, self.log_path]
         
-        if failed_deletes:
-            print("[LaTeX][WARN] Could not delete some files:")
-            for fname, error in failed_deletes:
-                print(f"  - {fname}: {error}")
-            print("[LaTeX] This may cause PDF regeneration issues.")
-
+        for f in files_to_remove:
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception as e:
+                    print(f"[PDF] Warning: Could not delete {f.name}: {e}")
+        
+        # Give Windows filesystem time to release files
+        time.sleep(0.3)
+    
     def _escape(self, text):
-        """Properly escape LaTeX special characters"""
+        """Escape LaTeX special characters while preserving readability"""
         if text is None:
             return ""
         if not isinstance(text, str):
             text = str(text)
         
-        # Replace in specific order to avoid double-escaping
+        # Order matters! Backslash must be first
         replacements = [
             ("\\", "\\textbackslash{}"),
             ("{", "\\{"),
@@ -96,57 +92,38 @@ class LatexReportGenerator:
             text = text.replace(old, new)
         
         return text
-
-    def _latex_image_block(self):
-        """Embed comparison images"""
-        out = ""
-        comparison_dir = Path("results/comparisons")
+    
+    def _format_list(self, items):
+        """Format a list of strings for LaTeX"""
+        if not items:
+            return ""
         
-        if not comparison_dir.exists():
-            return "\\textit{No comparison images found.}\n"
+        formatted = []
+        for item in items:
+            escaped = self._escape(str(item))
+            formatted.append(f"\\item {escaped}")
         
-        images = sorted(comparison_dir.glob("comp_*.jpg"))
-
-        if not images:
-            return "\\textit{No comparison images found.}\n"
-
-        # Limit to 30 images to keep PDF reasonable
-        for img in images[:30]:
-            # Convert to relative path from results/ directory and normalize
-            try:
-                # Get path relative to results directory
-                img_rel = img.relative_to(self.output_dir.parent)
-                # Use forward slashes for LaTeX (works on Windows and Unix)
-                img_path = str(img_rel).replace("\\", "/")
-            except ValueError:
-                # Fallback if relative path fails
-                img_path = str(img).replace("\\", "/")
-            
-            out += (
-                "\\begin{figure}[h!]\n"
-                "\\centering\n"
-                f"\\includegraphics[width=0.92\\textwidth]{{{img_path}}}\n"
-                "\\caption{Before/After Comparison}\n"
-                "\\end{figure}\n"
-                "\\clearpage\n\n"
-            )
-
-        return out
-
+        return "\n".join(formatted)
+    
     def build_tex(self):
-        """Build complete LaTeX document"""
+        """Build comprehensive LaTeX document"""
+        
         gps = self.audit.get("gps", {})
         pci = self.audit.get("pci_data", {})
         gis = self.audit.get("gis_profile", {})
         agg = self.audit.get("aggregate_comparison", {})
+        frames_analyzed = self.audit.get("frames_analyzed", {})
         irc_recs = self.irc.get("recommendations", [])
         priority_summary = self.irc.get("priority_summary", {})
         
-        # Get current timestamp
         report_date = datetime.now().strftime("%d %B %Y, %H:%M:%S")
-
-        # Document preamble
+        
+        # Start LaTeX document with lualatex-friendly preamble
         tex = r"""\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{fontspec}
+\usepackage{xunicode}
+\usepackage{xltxtra}
 \usepackage{graphicx}
 \usepackage{longtable}
 \usepackage{geometry}
@@ -154,33 +131,47 @@ class LatexReportGenerator:
 \usepackage{booktabs}
 \usepackage{xcolor}
 \usepackage{float}
-\geometry{margin=0.8in}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+
+\geometry{margin=0.9in}
+
+\setmainfont{Calibri}
+\setsansfont{Calibri}
+\setmonofont{Courier New}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{Road Safety Audit}
+\lhead{Report}
+\cfoot{\thepage}
 
 \begin{document}
 
 \title{\textbf{Road Safety Audit Report}}
-\author{Automated Road Audit System}
+\author{Automated Road Safety Audit System}
 \date{""" + report_date + r"""}
 \maketitle
 
 \tableofcontents
-\clearpage
+\newpage
 
 """
-
-        # GPS Location Section
-        tex += r"""
-\section{GPS Location}
-\begin{tabular}{ll}
-\textbf{Latitude:} & """ + self._escape(str(gps.get("latitude", "N/A"))) + r""" \\
-\textbf{Longitude:} & """ + self._escape(str(gps.get("longitude", "N/A"))) + r""" \\
-\end{tabular}
+        
+        # Section 1: GPS Location
+        tex += r"""\section{GPS Location \& Coordinates}
+"""
+        lat = gps.get("latitude", "N/A")
+        lon = gps.get("longitude", "N/A")
+        tex += f"""\\textbf{{Latitude:}} {self._escape(str(lat))} \\\\[0.3cm]
+\\textbf{{Longitude:}} {self._escape(str(lon))} \\\\[0.5cm]
 
 """
-
-        # GIS Profile Section
-        tex += r"""
-\section{GIS Profile}
+        
+        # Section 2: GIS Profile
+        tex += r"""\section{GIS Context \& Environmental Profile}
 """
         if gis:
             tex += r"""\begin{longtable}{|l|p{10cm}|}
@@ -189,34 +180,57 @@ class LatexReportGenerator:
 \endhead
 """
             for k, v in gis.items():
-                tex += f"{self._escape(k.replace('_', ' ').title())} & {self._escape(str(v))} \\\\ \\hline\n"
+                key_name = self._escape(k.replace("_", " ").title())
+                value = self._escape(str(v))
+                tex += f"{key_name} & {value} \\\\ \\hline\n"
             tex += "\\end{longtable}\n\n"
         else:
-            tex += "\\textit{No GIS profile data available.}\n\n"
+            tex += "\\textit{No GIS profile data available.}\\\\[0.5cm]\n\n"
+        
+        # Section 3: Frames Analyzed
+        tex += r"""\section{Video Analysis Summary}
+"""
+        base_frames = frames_analyzed.get("base", 0)
+        present_frames = frames_analyzed.get("present", 0)
+        tex += f"""\\begin{{tabular}}{{|l|r|}}
+\\hline
+\\textbf{{Metric}} & \\textbf{{Count}} \\\\
+\\hline
+Base Video Frames Analyzed & {base_frames} \\\\
+Present Video Frames Analyzed & {present_frames} \\\\
+\\hline
+\\end{{tabular}}\\\\[0.5cm]
 
-        # PCI Section
-        tex += r"""
-\section{Pavement Condition Index (PCI)}
+"""
+        
+        # Section 4: Pavement Condition Index
+        tex += r"""\section{Pavement Condition Index (PCI)}
 """
         base_pci = pci.get("base", {})
         pres_pci = pci.get("present", {})
         delta_pci = pci.get("delta", 0)
         
-        tex += r"""\begin{tabular}{|l|l|}
-\hline
-\textbf{Metric} & \textbf{Value} \\ \hline
-Base PCI Score & """ + str(base_pci.get("score", "-")) + r""" \\
-Base Rating & """ + self._escape(str(base_pci.get("rating", "-"))) + r""" \\ \hline
-Present PCI Score & """ + str(pres_pci.get("score", "-")) + r""" \\
-Present Rating & """ + self._escape(str(pres_pci.get("rating", "-"))) + r""" \\ \hline
-\textbf{Delta (Change)} & \textbf{""" + str(delta_pci) + r"""} \\ \hline
-\end{tabular}
+        base_score = base_pci.get("score", "-")
+        base_rating = self._escape(str(base_pci.get("rating", "-")))
+        pres_score = pres_pci.get("score", "-")
+        pres_rating = self._escape(str(pres_pci.get("rating", "-")))
+        
+        tex += f"""\\begin{{longtable}}{{|l|c|c|}}
+\\hline
+\\textbf{{Metric}} & \\textbf{{Base Video}} & \\textbf{{Present Video}} \\\\
+\\hline
+\\endhead
+PCI Score & {base_score} & {pres_score} \\\\
+Rating & {base_rating} & {pres_rating} \\\\
+\\hline
+\\end{{longtable}}
+
+\\textbf{{PCI Change (Delta):}} {delta_pci:+d} points\\\\[0.5cm]
 
 """
-
-        # Aggregate Comparison
-        tex += r"""
-\section{Aggregate Defect Comparison}
+        
+        # Section 5: Defect Comparison
+        tex += r"""\section{Aggregate Defect Comparison}
 """
         if agg:
             tex += r"""\begin{longtable}{|l|c|c|c|}
@@ -229,180 +243,218 @@ Present Rating & """ + self._escape(str(pres_pci.get("rating", "-"))) + r""" \\ 
                 base_val = counts.get("base", 0)
                 pres_val = counts.get("present", 0)
                 delta_val = counts.get("delta", 0)
-                tex += f"{label} & {base_val} & {pres_val} & {delta_val} \\\\ \\hline\n"
-            tex += "\\end{longtable}\n\n"
+                tex += f"{label} & {base_val} & {pres_val} & {delta_val:+d} \\\\ \\hline\n"
+            tex += "\\end{longtable}\\\\[0.5cm]\n\n"
         else:
-            tex += "\\textit{No aggregate comparison data available.}\n\n"
-
-        # IRC Recommendations
-        tex += r"""
-\section{IRC Maintenance Recommendations}
+            tex += "\\textit{No defect comparison data available.}\\\\[0.5cm]\n\n"
+        
+        # Section 6: IRC Recommendations
+        tex += r"""\section{IRC-Based Maintenance Recommendations}
 """
         if irc_recs:
-            tex += r"""\begin{longtable}{|p{3cm}|p{2cm}|p{1.8cm}|p{7cm}|}
-\hline
-\textbf{Issue} & \textbf{Severity} & \textbf{Priority} & \textbf{Suggested Actions} \\ \hline
-\endhead
-"""
-            for rec in irc_recs:
-                issue = self._escape(rec.get("issue", ""))
-                severity = self._escape(rec.get("severity", ""))
-                priority = self._escape(rec.get("priority", ""))
-                
-                actions = rec.get("suggested_actions", [])
-                actions_text = " \\newline ".join([self._escape(a) for a in actions])
-                
-                tex += f"{issue} & {severity} & {priority} & {actions_text} \\\\ \\hline\n"
-            
-            tex += "\\end{longtable}\n\n"
-        else:
-            tex += "\\textit{No IRC recommendations available.}\n\n"
+            tex += f"""Total Recommendations: {len(irc_recs)}\\\\[0.3cm]
 
-        # Priority Summary
-        tex += r"""
-\section{Maintenance Priority Summary}
+"""
+            for idx, rec in enumerate(irc_recs, 1):
+                issue = self._escape(rec.get("issue", "Unknown"))
+                severity = self._escape(rec.get("severity", "N/A"))
+                priority = self._escape(rec.get("priority", "N/A"))
+                count = rec.get("count", 0)
+                notes = self._escape(rec.get("notes", ""))
+                actions = rec.get("suggested_actions", [])
+                
+                tex += f"""\\subsection{{{idx}. {issue}}}
+\\textbf{{Severity:}} {severity} \\\\
+\\textbf{{Priority:}} {priority} \\\\
+\\textbf{{Count:}} {count} \\\\
+\\textbf{{Notes:}} {notes}\\\\[0.2cm]
+
+\\textbf{{Suggested Actions:}}
+\\begin{{enumerate}}
+"""
+                for action in actions:
+                    action_escaped = self._escape(action)
+                    tex += f"\\item {action_escaped}\n"
+                
+                tex += "\\end{enumerate}\n\n"
+        else:
+            tex += "\\textit{No IRC recommendations available.}\\\\[0.5cm]\n\n"
+        
+        # Section 7: Priority Summary
+        tex += r"""\section{Maintenance Priority Summary}
 """
         if priority_summary:
             counts = priority_summary.get("counts", {})
-            tex += r"""\begin{tabular}{|l|c|}
-\hline
-\textbf{Priority Level} & \textbf{Count} \\ \hline
-Overall Priority & """ + self._escape(str(priority_summary.get("overall_priority", "N/A"))) + r""" \\ \hline
-High Priority Items & """ + str(counts.get("High", 0)) + r""" \\ \hline
-Medium Priority Items & """ + str(counts.get("Medium", 0)) + r""" \\ \hline
-Low Priority Items & """ + str(counts.get("Low", 0)) + r""" \\ \hline
-\end{tabular}
-
-"""
-        else:
-            tex += "\\textit{No priority summary available.}\n\n"
-
-        # Frame-level changes
-        tex += r"""
-\section{Frame-Level Deterioration Summary}
-"""
-        changes = self.audit.get("frame_level_changes", [])
-        if changes:
-            # Limit to first 100 changes for readability
-            tex += r"""\begin{longtable}{|c|c|p{9cm}|}
-\hline
-\textbf{Frame} & \textbf{Time (s)} & \textbf{Changes Detected} \\ \hline
-\endhead
-"""
-            for change in changes[:100]:
-                frame_id = change.get("frame_id", "-")
-                timestamp = round(change.get("timestamp_seconds", 0), 2)
-                
-                change_items = change.get("changes", [])
-                change_desc = " \\newline ".join([
-                    f"{self._escape(c.get('element', ''))}: {self._escape(c.get('type', ''))}"
-                    for c in change_items
-                ])
-                
-                tex += f"{frame_id} & {timestamp} & {change_desc} \\\\ \\hline\n"
+            overall = self._escape(str(priority_summary.get("overall_priority", "N/A")))
+            high_count = counts.get("High", 0)
+            med_count = counts.get("Medium", 0)
+            low_count = counts.get("Low", 0)
             
-            tex += "\\end{longtable}\n\n"
-        else:
-            tex += "\\textit{No frame-level deterioration detected.}\n\n"
+            tex += f"""\\begin{{tabular}}{{|l|r|}}
+\\hline
+\\textbf{{Priority Level}} & \\textbf{{Count}} \\\\
+\\hline
+Overall Priority & {overall} \\\\
+High Priority Items & {high_count} \\\\
+Medium Priority Items & {med_count} \\\\
+Low Priority Items & {low_count} \\\\
+\\hline
+\\textbf{{TOTAL}} & \\textbf{{{high_count + med_count + low_count}}} \\\\
+\\hline
+\\end{{tabular}}\\\\[0.5cm]
 
-        # Comparison images
-        tex += r"""
-\section{Before/After Comparison Images}
 """
-        tex += self._latex_image_block()
+        else:
+            tex += "\\textit{No priority summary available.}\\\\[0.5cm]\n\n"
+        
+        # Footer
+        tex += r"""\section*{Report Information}
+\textit{This report was automatically generated by the Road Safety Audit System.}\\
+\textit{For detailed analysis, refer to the audit JSON outputs.}\\[0.3cm]
+\textit{Report Generated:} """ + report_date + r"""
 
-        # End document
-        tex += r"""
 \end{document}
 """
-
+        
         return tex
-
+    
     def generate(self):
-        """Generate LaTeX and compile to PDF"""
+        """Generate LaTeX and compile to PDF using LuaLaTeX"""
         
-        # Clean up old files first
-        self._cleanup_old_files()
+        print("\n[PDF] ============ LUALATEX PDF GENERATION START ============")
         
-        # Build LaTeX content
-        print("[LaTeX] Building document...")
+        # Step 1: Cleanup
+        print("[PDF] Cleaning up previous files...")
+        self._cleanup_files()
+        
+        # Step 2: Build and write LaTeX
+        print("[PDF] Building LaTeX document...")
         tex_content = self.build_tex()
-
-        # Write .tex file
-        with open(self.tex_path, "w", encoding="utf-8") as f:
-            f.write(tex_content)
         
-        print(f"[LaTeX] Written to {self.tex_path}")
-
-        # Try to compile with pdflatex
         try:
-            print("[LaTeX] Compiling PDF (this may take a moment)...")
+            self.tex_path.write_text(tex_content, encoding="utf-8")
+            print(f"[PDF] ✓ LaTeX file written: {self.tex_path.name}")
+        except Exception as e:
+            print(f"[PDF] ✗ Failed to write LaTeX file: {e}")
+            return (str(self.tex_path), None)
+        
+        # Step 3: Compile with lualatex
+        print("[PDF] Starting LuaLaTeX compilation...")
+        print(f"[PDF] Working directory: {self.output_dir}")
+        
+        try:
+            # Use lualatex with proper flags
+            cmd = [
+                "lualatex",
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-shell-escape",
+                str(self.tex_path)
+            ]
             
-            # Run pdflatex twice for proper cross-references
-            for run in [1, 2]:
+            print(f"[PDF] Command: {' '.join(cmd)}")
+            
+            # Run lualatex (usually needs 1-2 passes for TOC)
+            for run_num in range(1, 3):
+                print(f"\n[PDF] === LuaLaTeX Run {run_num}/2 ===")
+                
                 result = subprocess.run(
-                    ["pdflatex", "-interaction=nonstopmode", str(self.tex_path.name)],
+                    cmd,
                     cwd=str(self.output_dir),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=60,
-                    check=False
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                    shell=False  # False for list format
                 )
                 
-                if run == 1:
-                    print("[LaTeX] First pass complete")
+                output_text = result.stdout + result.stderr
+                
+                # Check for critical errors
+                has_error = "! " in output_text or "Fatal" in output_text
+                
+                if has_error:
+                    print(f"[PDF] ⚠ Run {run_num}: Issues detected")
+                    # Show error context
+                    for line in output_text.split('\n'):
+                        if "!" in line or "Error" in line or "error" in line:
+                            print(f"      {line[:120]}")
                 else:
-                    print("[LaTeX] Second pass complete")
+                    print(f"[PDF] ✓ Run {run_num}: Completed successfully")
+                
+                # Always print return code for debugging
+                if result.returncode != 0:
+                    print(f"[PDF] Return code: {result.returncode}")
+        
+        except subprocess.TimeoutExpired:
+            print("[PDF] ✗ TIMEOUT: LuaLaTeX took too long (>90 sec)")
+            return (str(self.tex_path), None)
+        
+        except FileNotFoundError:
+            print("[PDF] ✗ ERROR: lualatex not found in PATH")
+            print("[PDF] Install TeX Live or MiKTeX with lualatex")
+            return (str(self.tex_path), None)
+        
+        except Exception as e:
+            print(f"[PDF] ✗ ERROR: {type(e).__name__}: {e}")
+            return (str(self.tex_path), None)
+        
+        # Step 4: Verify PDF generation
+        print("\n[PDF] Verifying PDF creation...")
+        time.sleep(0.5)
+        
+        if self.pdf_path.exists():
+            pdf_size = self.pdf_path.stat().st_size
             
-            # Check if PDF was created
-            if self.pdf_path.exists():
-                print(f"[LaTeX] ✅ PDF generated: {self.pdf_path}")
+            if pdf_size > 1000:  # At least 1KB
+                print(f"[PDF] ✓✓✓ SUCCESS! PDF CREATED ({pdf_size:,} bytes)")
+                print(f"[PDF] Location: {self.pdf_path}")
+                print("[PDF] ============ PDF GENERATION COMPLETE ============\n")
                 return (str(self.tex_path), str(self.pdf_path))
             else:
-                print("[LaTeX] ⚠️ PDF not created. Check LaTeX logs.")
-                
-                # Try to show error from log
-                log_file = self.output_dir / "report.log"
-                if log_file.exists():
-                    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                        log_lines = f.readlines()
-                        # Find error lines
-                        for i, line in enumerate(log_lines):
-                            if "! " in line or "Error" in line:
-                                print(f"[LaTeX Error] {line.strip()}")
-                                if i + 1 < len(log_lines):
-                                    print(f"             {log_lines[i+1].strip()}")
-                
+                print(f"[PDF] ✗ PDF too small ({pdf_size} bytes) - likely empty")
                 return (str(self.tex_path), None)
-                
-        except FileNotFoundError:
-            print("[LaTeX] ⚠️ pdflatex not found. Install TeX Live or MikTeX.")
-            print("[LaTeX] .tex file created, but PDF compilation skipped.")
-            return (str(self.tex_path), None)
+        else:
+            print(f"[PDF] ✗ PDF not created at expected location")
+            print(f"[PDF] Expected: {self.pdf_path}")
             
-        except subprocess.TimeoutExpired:
-            print("[LaTeX] ⚠️ Compilation timeout. Document may be too large.")
-            return (str(self.tex_path), None)
+            # Debug: show generated files
+            print("[PDF] Files generated:")
+            for f in self.output_dir.glob("report.*"):
+                size = f.stat().st_size
+                print(f"[PDF]   {f.name}: {size:,} bytes")
             
-        except Exception as e:
-            print(f"[LaTeX] ⚠️ Compilation error: {e}")
             return (str(self.tex_path), None)
 
 
-# CLI test
+# =========================================================================
+# TEST SCRIPT
+# =========================================================================
+
 if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 2:
         print("Usage: python latex_report_generator.py <audit_json> [irc_json]")
+        print("Example: python latex_report_generator.py results/audit_output.json results/irc_output.json")
         sys.exit(1)
     
     audit_path = sys.argv[1]
     irc_path = sys.argv[2] if len(sys.argv) > 2 else None
     
-    gen = LatexReportGenerator(audit_path, irc_path)
-    tex, pdf = gen.generate()
-    
-    print(f"\nGenerated files:")
-    print(f"  LaTeX: {tex}")
-    print(f"  PDF:   {pdf or 'Not generated'}")
+    try:
+        print(f"Loading audit from: {audit_path}")
+        if irc_path:
+            print(f"Loading IRC from: {irc_path}")
+        
+        gen = LatexReportGenerator(audit_path, irc_path)
+        tex, pdf = gen.generate()
+        
+        print(f"\n✓ Complete!")
+        print(f"  LaTeX: {tex}")
+        print(f"  PDF:   {pdf if pdf else 'NOT GENERATED'}")
+        
+    except Exception as e:
+        print(f"\n✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

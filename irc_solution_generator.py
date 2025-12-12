@@ -1,29 +1,34 @@
 """
-irc_solution_generator.py — FINAL (expanded, deterministic, bug-fixed)
+irc_solution_generator_enhanced.py — COMPLETE (all 8 defects + frame-level analysis)
 
-Generates IRC-based recommendations from audit_output.json.
-Fully compatible with:
- - penultimate_road_audit_system.py
- - streamlit_app.py
- - cli_runner.py
+Generates comprehensive IRC-based recommendations from audit_output.json.
+NOW EXTRACTS ALL DEFECT TYPES:
+  1. Potholes
+  2. Cracks
+  3. Road Markings (faded/missing)
+  4. Road Signs (missing/damaged)
+  5. Traffic Lights (missing/damaged)
+  6. Streetlights & Furniture (missing/damaged)
+  7. Speed Breakers
+  8. Guardrails (occluded/damaged)
 
 Key improvements:
- - Implements all prior rules + added guardrail, drainage, signage, prioritization rules
- - Includes IRC code references in suggested actions (where applicable)
- - Defensive: handles missing keys gracefully, never crashes on partial JSON
- - Produces 'results/irc_output.json' and returns the report dict
+ - Counts defects from both aggregate_comparison AND frame-level detections
+ - Analyzes frame_level_changes for severity & change patterns
+ - IRC references for all 8 defect types
+ - Defensive JSON parsing with safe fallbacks
 """
 
 import json
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any
+from collections import defaultdict
 
-# Helpful typing aliases
 JSONDict = Dict[str, Any]
 
 
-class IRCSolutionGenerator:
+class EnhancedIRCSolutionGenerator:
     def __init__(self, audit_json_path: str):
         self.audit_json_path = Path(audit_json_path)
         if not self.audit_json_path.exists():
@@ -36,12 +41,13 @@ class IRCSolutionGenerator:
                 raise ValueError(f"Failed to parse JSON: {e}")
 
         self.recommendations: List[JSONDict] = []
+        self.defect_counters = defaultdict(lambda: {"base": 0, "present": 0, "delta": 0})
 
     # ---------------------------
     # Utility helpers
     # ---------------------------
     def _safe_get(self, path: List[str], default=None):
-        """Safe nested dict getter: path is list of keys."""
+        """Safe nested dict getter."""
         node = self.audit
         for p in path:
             if not isinstance(node, dict) or p not in node:
@@ -49,7 +55,8 @@ class IRCSolutionGenerator:
             node = node[p]
         return node
 
-    def _append_rec(self, issue: str, severity: str, count: int, actions: List[str], priority: str = "Normal", notes: str = ""):
+    def _append_rec(self, issue: str, severity: str, count: int, actions: List[str], 
+                    priority: str = "Normal", notes: str = ""):
         rec = {
             "issue": issue,
             "severity": severity,
@@ -60,25 +67,61 @@ class IRCSolutionGenerator:
         }
         self.recommendations.append(rec)
 
+    def _count_defect_in_frames(self, defect_type: str) -> Dict[str, int]:
+        """
+        Count defects from frame-level data.
+        defect_type: "potholes", "cracks", "road_signs", "traffic_lights", "furniture", etc.
+        """
+        base_count = 0
+        present_count = 0
+
+        # Count in base frames
+        base_frames = self._safe_get(["base_frame_data"], []) or []
+        for frame in base_frames:
+            base_count += len(frame.get(defect_type, []) or [])
+
+        # Count in present frames
+        present_frames = self._safe_get(["present_frame_data"], []) or []
+        for frame in present_frames:
+            present_count += len(frame.get(defect_type, []) or [])
+
+        return {
+            "base": base_count,
+            "present": present_count,
+            "delta": present_count - base_count
+        }
+
+    def _extract_frame_changes_for_type(self, element_name: str) -> List[str]:
+        """
+        Extract specific change types from frame_level_changes.
+        Returns list of change descriptions matching the element.
+        """
+        changes_list = self._safe_get(["frame_level_changes"], []) or []
+        relevant_changes = []
+        
+        for frame_change in changes_list:
+            for change in frame_change.get("changes", []):
+                if element_name.lower() in change.get("element", "").lower():
+                    relevant_changes.append(change.get("type", "Unknown change"))
+        
+        return relevant_changes
+
     # ---------------------------
-    # Rule: Potholes
+    # Rule 1: Potholes
     # ---------------------------
     def rule_potholes(self):
-        # We use aggregate_comparison.potholes.present and delta
-        base = self._safe_get(["aggregate_comparison", "potholes", "base"], 0) or 0
-        present = self._safe_get(["aggregate_comparison", "potholes", "present"], 0) or 0
-        delta = self._safe_get(["aggregate_comparison", "potholes", "delta"], present - base)
-        count = int(present)
+        agg = self._safe_get(["aggregate_comparison", "potholes"], {}) or {}
+        base = int(agg.get("base", 0) or 0)
+        present = int(agg.get("present", 0) or 0)
+        delta = int(agg.get("delta", present - base) or 0)
+        count = present
 
-        if count <= 0 and (delta is None or int(delta) <= 0):
+        if count <= 0 and delta <= 0:
             return
 
-        # Severity & actions mapping (IRC references included)
         if delta <= 0:
             severity = "None"
-            actions = [
-                "No new potholes detected. Maintain periodic inspection schedule.",
-            ]
+            actions = ["No new potholes detected. Maintain periodic inspection schedule."]
             priority = "Low"
         elif delta <= 2:
             severity = "Moderate"
@@ -91,37 +134,34 @@ class IRCSolutionGenerator:
         else:
             severity = "High"
             actions = [
-                "Full-depth patching recommended (remove failed material, replace with hot mix). Follow IRC:SP:100 guidelines for permanent patches.",
+                "Full-depth patching recommended (remove failed material, replace with hot mix). Follow IRC:SP:100.",
                 "Inspect and repair subgrade/drainage near pothole locations before resurfacing to avoid recurrence.",
-                "If multiple clusters are present, consider sectional resurfacing or overlay (assess structural condition)."
+                "If multiple clusters present, consider sectional resurfacing or overlay."
             ]
             priority = "High"
 
-        notes = f"Base count={base}, Present count={present}, Delta={delta}."
+        notes = f"Base={base}, Present={present}, Delta={delta}."
         self._append_rec("Potholes", severity, count, actions, priority, notes)
 
     # ---------------------------
-    # Rule: Cracks
+    # Rule 2: Cracks
     # ---------------------------
     def rule_cracks(self):
-        base = self._safe_get(["aggregate_comparison", "cracks", "base"], 0) or 0
-        present = self._safe_get(["aggregate_comparison", "cracks", "present"], 0) or 0
-        delta = self._safe_get(["aggregate_comparison", "cracks", "delta"], present - base)
-        count = int(present)
+        agg = self._safe_get(["aggregate_comparison", "cracks"], {}) or {}
+        base = int(agg.get("base", 0) or 0)
+        present = int(agg.get("present", 0) or 0)
+        delta = int(agg.get("delta", present - base) or 0)
+        count = present
 
-        if count <= 0 and (delta is None or int(delta) <= 0):
+        if count <= 0 and delta <= 0:
             return
 
-        # Use crack width statistics if available in frame data (take max width observed)
+        # Extract max crack width from present frames
         max_crack_width_cm = 0.0
-        frames = self._safe_get(["present_frame_data"], []) or []
-        for f in frames:
-            for c in f.get("cracks", []):
-                w = c.get("width_cm") or c.get("width_cm", 0) or c.get("width_px", 0)
-                try:
-                    w = float(w)
-                except Exception:
-                    w = 0.0
+        present_frames = self._safe_get(["present_frame_data"], []) or []
+        for frame in present_frames:
+            for crack in frame.get("cracks", []) or []:
+                w = float(crack.get("width_cm") or crack.get("width_px", 0) or 0)
                 if w > max_crack_width_cm:
                     max_crack_width_cm = w
 
@@ -134,35 +174,35 @@ class IRCSolutionGenerator:
             if max_crack_width_cm >= 6 or delta > 5:
                 severity = "High"
                 actions = [
-                    "Widespread/wide cracks detected. Consider surface renewal or overlay depending on structural evaluation.",
-                    "If cracks indicate fatigue, plan for milling + resurfacing (see IRC:SP:76 / IRC guidelines on overlays).",
-                    "Conduct structural investigation of pavement if subgrade issues suspected."
+                    "Widespread/wide cracks detected. Consider surface renewal or overlay.",
+                    "If cracks indicate fatigue, plan for milling + resurfacing (see IRC:SP:76).",
+                    "Conduct structural investigation if subgrade issues suspected."
                 ]
                 priority = "High"
             else:
                 severity = "Moderate"
                 actions = [
-                    "Apply crack sealing using elastomeric sealants after cleaning (refer IRC:116 for procedures).",
+                    "Apply crack sealing using elastomeric sealants after cleaning (refer IRC:116).",
                     "Ensure cracks are cleaned and dried before sealant application."
                 ]
                 priority = "Medium"
 
-        notes = f"Base={base}, Present={present}, Delta={delta}, Max crack width (cm)={max_crack_width_cm:.2f}"
+        notes = f"Base={base}, Present={present}, Delta={delta}, Max width (cm)={max_crack_width_cm:.2f}"
         self._append_rec("Cracks", severity, count, actions, priority, notes)
 
     # ---------------------------
-    # Rule: Faded / Missing Markings
+    # Rule 3: Road Markings
     # ---------------------------
     def rule_faded_markings(self):
-        base = self._safe_get(["aggregate_comparison", "faded_marking_frames", "base"], 0) or 0
-        present = self._safe_get(["aggregate_comparison", "faded_marking_frames", "present"], 0) or 0
-        delta = self._safe_get(["aggregate_comparison", "faded_marking_frames", "delta"], present - base)
-        count = int(present)
+        agg = self._safe_get(["aggregate_comparison", "faded_marking_frames"], {}) or {}
+        base = int(agg.get("base", 0) or 0)
+        present = int(agg.get("present", 0) or 0)
+        delta = int(agg.get("delta", present - base) or 0)
+        count = present
 
-        if count <= 0 and (delta is None or int(delta) <= 0):
+        if count <= 0 and delta <= 0:
             return
 
-        # Severity heuristics
         if delta <= 0:
             severity = "None"
             actions = ["Markings stable. Maintain current repaint cycle."]
@@ -177,120 +217,247 @@ class IRCSolutionGenerator:
         else:
             severity = "High"
             actions = [
-                "Major loss of marking visibility—perform full re-marking with thermoplastic materials and glass beads as per IRC:35.",
-                "If budget permits, consider high-durability thermoplastic or premix systems (longer service life).",
+                "Major loss of marking visibility—perform full re-marking with thermoplastic materials and glass beads (IRC:35).",
+                "Consider high-durability thermoplastic or premix systems for longer service life.",
                 "Improve nighttime retro-reflectivity testing schedule after re-marking."
             ]
             priority = "High"
 
-        notes = f"Base faded frames={base}, Present faded frames={present}, Delta={delta}."
+        notes = f"Base={base}, Present={present}, Delta={delta}."
         self._append_rec("Road Markings", severity, count, actions, priority, notes)
 
     # ---------------------------
-    # Rule: Roadside Signage & Furniture (signs, lights)
+    # Rule 4: Road Signs
     # ---------------------------
-    def rule_roadside_furniture(self):
-        # For signage, check aggregate if available (we use 'road_signs' delta if present)
-        # fallback: use furniture delta (difference in counts)
-        base_signs = self._safe_get(["aggregate_comparison", "road_signs", "base"], None)
-        present_signs = self._safe_get(["aggregate_comparison", "road_signs", "present"], None)
-        delta_signs = None
-        if base_signs is not None and present_signs is not None:
-            try:
-                delta_signs = int(present_signs) - int(base_signs)
-            except Exception:
-                delta_signs = None
-
-        # If signage aggregate isn't present, attempt to detect via furniture delta
-        base_f = self._safe_get(["aggregate_comparison", "furniture", "base"], None)
-        present_f = self._safe_get(["aggregate_comparison", "furniture", "present"], None)
-        delta_f = None
-        if base_f is not None and present_f is not None:
-            try:
-                delta_f = int(present_f) - int(base_f)
-            except Exception:
-                delta_f = None
-
-        missing = 0
-        if delta_signs is not None and delta_signs < 0:
-            missing = abs(delta_signs)
-            reason = "signs"
-        elif delta_f is not None and delta_f < 0:
-            missing = abs(delta_f)
-            reason = "furniture"
+    def rule_road_signs(self):
+        # Try aggregate first
+        agg = self._safe_get(["aggregate_comparison", "road_signs"], {})
+        
+        if agg:
+            base = int(agg.get("base", 0) or 0)
+            present = int(agg.get("present", 0) or 0)
+            delta = int(agg.get("delta", present - base) or 0)
         else:
-            missing = 0
-            reason = ""
+            # Fall back to frame-level counting
+            counts = self._count_defect_in_frames("road_signs")
+            base = counts["base"]
+            present = counts["present"]
+            delta = counts["delta"]
 
-        if missing <= 0:
+        # Detect missing signs via frame changes
+        changes = self._extract_frame_changes_for_type("Road Signs")
+        missing_count = len([c for c in changes if "missing" in c.lower()])
+        new_count = len([c for c in changes if "new" in c.lower()])
+
+        # Use the higher count
+        count = max(present, missing_count)
+
+        if count <= 0 and delta <= 0 and missing_count == 0:
+            return
+
+        if missing_count > 0 or delta < 0:
+            severity = "High"
+            priority = "High"
+            actions = [
+                "Replace missing/damaged signs per IRC:67 standards (retro-reflective sheeting, correct sizing).",
+                "Use Type-XI or appropriate reflective sheeting for high-speed corridors as per IRC recommendations.",
+                "Inspect mounting posts and foundations; repair or replace to restore sight distance and stability."
+            ]
+            notes = f"Frame changes detected: {missing_count} missing, {new_count} new. Base={base}, Present={present}, Delta={delta}."
+        else:
+            severity = "None"
+            priority = "Low"
+            actions = ["Signs are intact. Maintain periodic inspection for damage."]
+            notes = f"Base={base}, Present={present}, Delta={delta}."
+
+        self._append_rec("Road Signs", severity, count, actions, priority, notes)
+
+    # ---------------------------
+    # Rule 5: Traffic Lights
+    # ---------------------------
+    def rule_traffic_lights(self):
+        # Try aggregate
+        agg = self._safe_get(["aggregate_comparison", "traffic_lights"], {})
+        
+        if agg:
+            base = int(agg.get("base", 0) or 0)
+            present = int(agg.get("present", 0) or 0)
+            delta = int(agg.get("delta", present - base) or 0)
+        else:
+            # Fall back to frame-level
+            counts = self._count_defect_in_frames("traffic_lights")
+            base = counts["base"]
+            present = counts["present"]
+            delta = counts["delta"]
+
+        # Detect changes
+        changes = self._extract_frame_changes_for_type("Traffic Light")
+        missing_count = len([c for c in changes if "missing" in c.lower()])
+
+        count = max(present, missing_count)
+
+        if count <= 0 and delta <= 0 and missing_count == 0:
+            return
+
+        if missing_count > 0 or delta < 0:
+            severity = "High"
+            priority = "High"
+            actions = [
+                "Replace missing or non-functional traffic signals to restore traffic control.",
+                "Verify signal timing and phasing per IRC:103 traffic control guidelines.",
+                "Inspect foundations and wiring; replace if corroded or damaged.",
+                "Restore visibility by trimming vegetation around signal heads."
+            ]
+            notes = f"Missing: {missing_count}. Base={base}, Present={present}, Delta={delta}."
+        else:
+            severity = "None"
+            priority = "Low"
+            actions = ["Traffic signals are functional. Continue maintenance schedule."]
+            notes = f"Base={base}, Present={present}, Delta={delta}."
+
+        self._append_rec("Traffic Lights", severity, count, actions, priority, notes)
+
+    # ---------------------------
+    # Rule 6: Streetlights & Furniture
+    # ---------------------------
+    def rule_streetlights_and_furniture(self):
+        # Try aggregate
+        agg = self._safe_get(["aggregate_comparison", "furniture"], {})
+        
+        if agg:
+            base = int(agg.get("base", 0) or 0)
+            present = int(agg.get("present", 0) or 0)
+            delta = int(agg.get("delta", present - base) or 0)
+        else:
+            counts = self._count_defect_in_frames("furniture")
+            base = counts["base"]
+            present = counts["present"]
+            delta = counts["delta"]
+
+        # Detect streetlight-specific changes
+        changes = self._extract_frame_changes_for_type("Roadside Furniture")
+        missing_count = len([c for c in changes if "missing" in c.lower() or "damaged" in c.lower()])
+
+        count = max(present, missing_count)
+
+        if count <= 0 and delta <= 0 and missing_count == 0:
+            return
+
+        if missing_count > 0 or delta < 0:
+            severity = "High"
+            priority = "High"
+            actions = [
+                "Replace missing or damaged streetlights to improve nighttime safety (IRC guidelines on street lighting).",
+                "Inspect poles for corrosion, cracks, or tilt; repair or replace as necessary.",
+                "Ensure adequate spacing and luminance levels per IRC:83 standards.",
+                "Clean light fixtures and replace non-functional lamps regularly."
+            ]
+            notes = f"Missing/damaged count: {missing_count}. Base={base}, Present={present}, Delta={delta}."
+        else:
+            severity = "None"
+            priority = "Low"
+            actions = ["Streetlights and furniture are functional. Maintain routine maintenance schedule."]
+            notes = f"Base={base}, Present={present}, Delta={delta}."
+
+        self._append_rec("Streetlights & Roadside Furniture", severity, count, actions, priority, notes)
+
+    # ---------------------------
+    # Rule 7: Speed Breakers
+    # ---------------------------
+    def rule_speed_breakers(self):
+        # Count from frame data
+        counts = self._count_defect_in_frames("speed_breakers")
+        base = counts["base"]
+        present = counts["present"]
+        delta = counts["delta"]
+
+        if present <= 0 and delta == 0:
             return
 
         actions = [
-            "Replace damaged/missing signs per IRC:67 standards (retro-reflective sheeting, correct sizing).",
-            "Use Type-XI or appropriate reflective sheeting for high-speed corridors as per IRC recommendations.",
-            "Inspect mounting posts and foundations; repair or replace to restore correct sight distance and stability."
+            "Inspect speed breaker condition for cracks, displacement, or deterioration.",
+            "Ensure height and geometry meet IRC specifications for the road classification.",
+            "Maintain adequate approach marking and signage (advance warning signs at 40m for urban roads).",
+            "Consider surface treatment (paint or reflectors) for nighttime visibility."
         ]
-        notes = f"Missing count inferred from {reason} delta."
+        severity = "Moderate" if present > 3 else "None"
+        priority = "Medium" if present > 3 else "Low"
+        notes = f"Base={base}, Present={present}, Delta={delta}."
 
-        self._append_rec("Roadside Signage / Furniture", "High", missing, actions, "High", notes)
+        self._append_rec("Speed Breakers", severity, present, actions, priority, notes)
 
     # ---------------------------
-    # Rule: Guardrails & Occlusion (vegetation)
+    # Rule 8: Guardrails
     # ---------------------------
     def rule_guardrails(self):
-        # Look into per-frame furniture items for guardrail labels & occlusion flags
+        # Count from frame data
+        counts = self._count_defect_in_frames("furniture")  # Guardrails often in furniture
+        base = counts["base"]
+        present = counts["present"]
+
+        # Detect occlusion
         present_frames = self._safe_get(["present_frame_data"], []) or []
-        guardrail_total = 0
         guardrail_occluded = 0
+        guardrail_damaged = 0
 
-        for f in present_frames:
-            for det in f.get("furniture", []) + f.get("road_signs", []):
+        for frame in present_frames:
+            for det in frame.get("furniture", []) or []:
                 label = str(det.get("label", "")).lower()
-                if "guardrail" in label or "guard rail" in label:
-                    guardrail_total += 1
-                    if det.get("occluded", False) or det.get("occlusion_vegetation_fraction", 0) > 0.05:
+                if "guardrail" in label or "guard_rail" in label or "guard rail" in label:
+                    if det.get("occluded", False):
                         guardrail_occluded += 1
+                    if det.get("root_cause") and "damaged" in det.get("root_cause", "").lower():
+                        guardrail_damaged += 1
 
-        if guardrail_total == 0 and guardrail_occluded == 0:
+        # Detect changes from frame changes
+        changes = self._extract_frame_changes_for_type("Guardrail")
+        missing_in_changes = len([c for c in changes if "missing" in c.lower()])
+
+        total_issues = guardrail_occluded + guardrail_damaged + missing_in_changes
+
+        if total_issues == 0:
             return
 
-        # If occluded frames are significant, recommend vegetation management
-        if guardrail_occluded > 0:
-            actions = [
-                "Vegetation trimming/clearance recommended to restore guardrail visibility and inspect for damage.",
-                "If guardrail cannot be inspected due to persistent occlusion, schedule manual inspection after clearance.",
-                "Where guardrail is missing or structurally damaged, replace per IRC:96 guidelines and realign as necessary."
-            ]
-            notes = f"Detected {guardrail_occluded} occluded guardrail detections across frames; total guardrail detections={guardrail_total}."
-            priority = "Medium" if guardrail_occluded < 3 else "High"
-            self._append_rec("Guardrails (Occluded / Possibly Damaged)", "Medium", guardrail_occluded, actions, priority, notes)
+        severity = "High" if missing_in_changes > 0 or guardrail_damaged > 0 else "Medium"
+        priority = "High" if severity == "High" else "Medium"
+
+        actions = [
+            "Vegetation trimming/clearance recommended to restore guardrail visibility and enable inspection.",
+            "If guardrail is missing or structurally damaged, replace per IRC:96 guidelines.",
+            "Realign guardrail as necessary; ensure proper alignment with roadway geometry.",
+            "Inspect foundations and connections; reinforce or replace if corroded or loose."
+        ]
+        notes = f"Occluded: {guardrail_occluded}, Damaged: {guardrail_damaged}, Missing: {missing_in_changes}. Base={base}, Present={present}."
+
+        self._append_rec("Guardrails", severity, total_issues, actions, priority, notes)
 
     # ---------------------------
-    # Rule: Drainage & Surface (inferred from potholes/crack patterns)
+    # Rule 9: Drainage & Surface
     # ---------------------------
     def rule_drainage_and_surface(self):
-        # Infer from GIS profile (drainage_quality) and pothole/crack density
         gis = self._safe_get(["gis_profile"], {}) or {}
         drainage = gis.get("drainage_quality", "Unknown")
         pothole_delta = int(self._safe_get(["aggregate_comparison", "potholes", "delta"], 0) or 0)
         crack_delta = int(self._safe_get(["aggregate_comparison", "cracks", "delta"], 0) or 0)
 
-        if drainage in ["Poor", "Blocked"] or pothole_delta > 3 or crack_delta > 5:
-            actions = [
-                f"Investigate roadside drainage condition (current rating: {drainage}). Clear blockages, regrade channels and repair inlets as needed.",
-                "If water ingress is evident under pavement, plan sub-surface drainage improvement prior to resurfacing (reduce recurrence).",
-                "Coordinate drainage repairs with pavement rehabilitation works to maximise life-cycle benefit."
-            ]
-            severity = "High" if drainage in ["Poor", "Blocked"] or pothole_delta > 5 else "Medium"
-            notes = f"Drainage rating={drainage}; pothole delta={pothole_delta}; crack delta={crack_delta}."
-            priority = "High" if severity == "High" else "Medium"
-            self._append_rec("Drainage & Pavement Moisture Issues", severity, 1, actions, priority, notes)
+        if drainage not in ["Poor", "Blocked"] and pothole_delta <= 3 and crack_delta <= 5:
+            return
+
+        actions = [
+            f"Investigate roadside drainage condition (current rating: {drainage}). Clear blockages, regrade channels.",
+            "If water ingress is evident, plan sub-surface drainage improvement prior to resurfacing.",
+            "Coordinate drainage repairs with pavement rehabilitation works."
+        ]
+        severity = "High" if drainage in ["Poor", "Blocked"] else "Medium"
+        priority = "High" if severity == "High" else "Medium"
+        notes = f"Drainage={drainage}; pothole delta={pothole_delta}; crack delta={crack_delta}."
+
+        self._append_rec("Drainage & Pavement Moisture", severity, 1, actions, priority, notes)
 
     # ---------------------------
-    # Post-process: Prioritization & Summary
+    # Prioritization
     # ---------------------------
-    def rule_prioritization(self):
-        # Add an overall priority summary (High if any High)
+    def rule_prioritization(self) -> JSONDict:
         priorities = {"High": 0, "Medium": 0, "Low": 0}
         for r in self.recommendations:
             p = r.get("priority", "Normal")
@@ -303,43 +470,42 @@ class IRCSolutionGenerator:
             else:
                 priorities["Low"] += 1
 
-        overall_priority = "Low"
+        overall = "Low"
         if priorities["High"] > 0:
-            overall_priority = "High"
+            overall = "High"
         elif priorities["Medium"] > 0:
-            overall_priority = "Medium"
+            overall = "Medium"
 
-        return {
-            "overall_priority": overall_priority,
-            "counts": priorities,
-        }
+        return {"overall_priority": overall, "counts": priorities}
 
     # ---------------------------
-    # Main generator
+    # Main generate method
     # ---------------------------
     def generate(self) -> JSONDict:
         self.recommendations = []
 
-        # Execute rules; order matters for sensible output
+        # Execute all 9 rules
         try:
             self.rule_potholes()
             self.rule_cracks()
             self.rule_faded_markings()
+            self.rule_road_signs()
+            self.rule_traffic_lights()
+            self.rule_streetlights_and_furniture()
+            self.rule_speed_breakers()
             self.rule_guardrails()
-            self.rule_roadside_furniture()
             self.rule_drainage_and_surface()
         except Exception as e:
-            # Defensive: don't crash generation for unexpected structure
+            print(f"[ERROR] Rule execution failed: {e}")
             self.recommendations.append({
                 "issue": "RuleEngineError",
                 "severity": "High",
                 "count": 0,
                 "priority": "High",
                 "suggested_actions": [],
-                "notes": f"Rule engine encountered an exception: {str(e)}"
+                "notes": f"Rule engine error: {str(e)}"
             })
 
-        # Prioritization summary
         priority_summary = self.rule_prioritization()
 
         irc_report: JSONDict = {
@@ -349,29 +515,32 @@ class IRCSolutionGenerator:
             "gis_profile": self.audit.get("gis_profile", {}),
             "pci_summary": self.audit.get("pci_data", {}),
             "aggregate_comparison": self.audit.get("aggregate_comparison", {}),
+            "defect_count_summary": dict(self.defect_counters),
             "recommendations": self.recommendations,
             "priority_summary": priority_summary,
-            "notes": "Recommendations reference general IRC guidelines (e.g., IRC:35, IRC:67, IRC:SP:100, IRC:116). Adapt to local contract specifications as needed.",
+            "notes": "Comprehensive IRC-based recommendations covering all 8 defect types. References: IRC:35, IRC:67, IRC:83, IRC:96, IRC:103, IRC:116, IRC:SP:76, IRC:SP:100."
         }
 
-        # Write to results/irc_output.json (safe)
-        out_path = Path("results") / "irc_output.json"
+        # Write to results
+        out_path = Path("results") / "irc_output_enhanced.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(irc_report, f, indent=2, ensure_ascii=False)
 
+        print(f"✅ Enhanced IRC report generated: {out_path}")
         return irc_report
 
 
-# If run as script, quick smoke-test (does not execute unless invoked)
+# Quick test
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python irc_solution_generator.py <path_to_audit_json>")
-        print("This will write results/irc_output.json")
+        print("Usage: python irc_solution_generator_enhanced.py <audit_json_path>")
         sys.exit(1)
 
-    gen = IRCSolutionGenerator(sys.argv[1])
+    gen = EnhancedIRCSolutionGenerator(sys.argv[1])
     report = gen.generate()
-    print("Generated IRC recommendations (results/irc_output.json).")
+    print(f"Total recommendations: {len(report['recommendations'])}")
+    for rec in report["recommendations"]:
+        print(f"  - {rec['issue']}: {rec['severity']} (Priority: {rec['priority']})")

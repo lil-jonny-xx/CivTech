@@ -2,6 +2,7 @@
 penultimate_road_audit_system.py
 
 Final merged comparator engine (Option A features included).
+- Dual Model Inference (Custom + COCO Base)
 - Guardrail occlusion handling (vegetation mask)
 - Temporal deduplication / cooldown
 - Segmentation auto-download attempt (placeholder URL)
@@ -370,6 +371,36 @@ class EnhancedRoadAuditSystem:
 
         self._load_models()
 
+    def _normalize_label(self, raw_label: str):
+        """Convert YOLO model class names into internal category buckets."""
+        l = raw_label.strip().lower()
+
+        if l in ["Potholes", "pothole"]:
+            return "pothole"
+        if l in ["Cracks", "crack"]:
+            return "crack"
+        if l in ["SpeedBreaker", "speed_breaker", "speed_bump"]:
+            return "speedbreaker"
+        if l in ["StreetSigns", "street_signs", "street_sign", "sign", "signboard", "stop sign"]:
+            return "sign"
+        if l in ["StreetLights", "street_light", "streetlight"]:
+            return "streetlight"
+        if l in ["TrafficLights", "traffic_lights", "trafficlight", "signal", "traffic light"]:
+            return "trafficlight"
+        if l in ["GuardRails", "guardrail"]:
+            return "guardrail"
+        if l in ["ZebraCrossing", "pedestrian_crossing"]:
+            return "zebra"
+        
+        # COCO fallbacks
+        if l in ["car", "truck", "bus", "motorcycle"]:
+            return "vehicle"
+        if l in ["person"]:
+            return "pedestrian"
+
+        return l  # fallback
+
+
 
     def _reset_pci_stats(self):
         """Reset PCI statistics for a new video"""
@@ -393,10 +424,10 @@ class EnhancedRoadAuditSystem:
         try:
             if Path(self.config["pretrained_model"]).exists():
                 self.base_model = YOLO(self.config["pretrained_model"])
-                print(f"[INIT] Loaded base model (fallback): {self.config['pretrained_model']}")
+                print(f"[INIT] Loaded base model (COCO): {self.config['pretrained_model']}")
             else:
                 self.base_model = None
-                print("[INIT][WARN] Base model not found; fallback disabled.")
+                print("[INIT][WARN] Base model not found; processing will use Custom model only.")
         except Exception as e:
             print(f"[WARN] Failed to load base model: {e}")
             self.base_model = None
@@ -680,7 +711,7 @@ class EnhancedRoadAuditSystem:
         return frames
 
     # ----------------- collate frame results -----------------
-    def _collate_frame_results(self, frame_path, custom_result, seg_result_unused, gis_profile, frame_idx):
+    def _collate_frame_results(self, frame_path, custom_result, base_result, gis_profile, frame_idx):
         img = cv2.imread(frame_path)
         if img is None:
             self._log(f"[FRAME][WARN] Could not read frame image: {frame_path}")
@@ -688,8 +719,10 @@ class EnhancedRoadAuditSystem:
 
         self.pci_stats["total_frames"] += 1
 
+        # analyze markings (segmentation or fallback)
         markings_info, marking_dets = self._analyze_markings(img)
 
+        # Base frame structure
         frame_data = {
             "frame": frame_path,
             "frame_idx": frame_idx,
@@ -700,95 +733,183 @@ class EnhancedRoadAuditSystem:
             "traffic_lights": [],
             "furniture": [],
             "markings": markings_info,
-            "marking_detections": marking_dets,
+            "marking_detections": marking_dets,   # list of {label, area_px, fade_ratio?}
         }
 
-        if markings_info["marking_wear_pct"] > 50:
+        # update PCI faded marks count
+        if markings_info.get("marking_wear_pct", 0.0) > 50:
             self.pci_stats["faded_marks"] += 1
 
-        if custom_result is not None and getattr(custom_result, "boxes", None) is not None:
+        # --- Helper for bbox logic ---
+        def norm_label(lbl):
+            return str(lbl).strip().lower().replace(" ", "_")
+
+        def make_id_key(label, bbox):
+            try:
+                x1, y1, x2, y2 = map(float, bbox)
+            except Exception:
+                x1 = y1 = x2 = y2 = 0.0
+            cx = int((x1 + x2) / 2.0)
+            cy = int((y1 + y2) / 2.0)
+            w = int(max(1, x2 - x1))
+            h = int(max(1, y2 - y1))
+            return f"{label}::{cx}_{cy}_{w}_{h}"
+
+        def iou_bbox(b1, b2):
+            x1 = max(b1[0], b2[0])
+            y1 = max(b1[1], b2[1])
+            x2 = min(b1[2], b2[2])
+            y2 = min(b1[3], b2[3])
+            inter_w = max(0.0, x2 - x1)
+            inter_h = max(0.0, y2 - y1)
+            inter = inter_w * inter_h
+            a1 = max(0.0, (b1[2] - b1[0])) * max(0.0, (b1[3] - b1[1]))
+            a2 = max(0.0, (b2[2] - b2[0])) * max(0.0, (b2[3] - b2[1]))
+            union = a1 + a2 - inter
+            if union <= 0: return 0.0
+            return inter / union
+
+        # Collect detections from BOTH models
+        # We define a structure: {"label": str, "conf": float, "bbox": [x1,y1,x2,y2]}
+        combined_detections = []
+
+        # 1. Process Custom Model (Priority)
+        if custom_result and getattr(custom_result, "boxes", None) is not None:
             for box in custom_result.boxes:
                 try:
                     conf = float(box.conf[0])
-                except Exception:
-                    conf = float(getattr(box, "conf", 0) or 0)
-                if conf < self.config["min_confidence"]:
-                    continue
-
-                try:
+                    if conf < self.config.get("min_confidence", 0.25): continue
                     cls_idx = int(box.cls[0])
                     raw_label = str(self.custom_model.names.get(cls_idx, f"class_{cls_idx}"))
+                    bbox = [float(x) for x in box.xyxy[0].tolist()]
+                    
+                    combined_detections.append({
+                        "raw_label": raw_label,
+                        "label_norm": self._normalize_label(raw_label),
+                        "conf": conf,
+                        "bbox": bbox,
+                        "source": "custom"
+                    })
                 except Exception:
-                    raw_label = str(getattr(box, "cls", "unknown"))
+                    continue
 
+        # 2. Process Base Model (Secondary - Deduplicated)
+        if base_result and getattr(base_result, "boxes", None) is not None:
+            for box in base_result.boxes:
                 try:
-                    bbox = box.xyxy[0].tolist()
+                    conf = float(box.conf[0])
+                    if conf < self.config.get("min_confidence", 0.25): continue
+                    cls_idx = int(box.cls[0])
+                    raw_label = str(self.base_model.names.get(cls_idx, f"class_{cls_idx}"))
+                    bbox = [float(x) for x in box.xyxy[0].tolist()]
+                    
+                    label_norm = self._normalize_label(raw_label)
+
+                    # Deduplication: Check if this overlaps significantly with an existing Custom detection
+                    is_duplicate = False
+                    for existing in combined_detections:
+                        if iou_bbox(bbox, existing["bbox"]) > 0.45:
+                            is_duplicate = True
+                            break
+                    
+                    if not is_duplicate:
+                        combined_detections.append({
+                            "raw_label": raw_label,
+                            "label_norm": label_norm,
+                            "conf": conf,
+                            "bbox": bbox,
+                            "source": "base"
+                        })
                 except Exception:
-                    bbox = [0, 0, 0, 0]
+                    continue
 
-                det = {"label": raw_label, "confidence": conf, "bbox": bbox, "occluded": False}
-                lower = raw_label.lower()
+        # --- Categorize Detections ---
+        for item in combined_detections:
+            raw_label = item["raw_label"]
+            label_norm = item["label_norm"]
+            conf = item["conf"]
+            bbox = item["bbox"]
 
-                # guardrail occlusion
-                if "guardrail" in lower or "guard rail" in lower:
-                    occluded, veg_frac = self._is_guardrail_occluded_by_vegetation(img, bbox)
-                    if occluded:
-                        det["occluded"] = True
-                        det["occlusion_vegetation_fraction"] = float(veg_frac)
-                        key = f"guardrail::{int(bbox[0])}_{int(bbox[1])}_{int(bbox[2])}_{int(bbox[3])}"
-                        state = self.occlusion_state.get(key, {"occluded_frames": 0, "last_seen_frame": frame_idx})
-                        state["last_seen_frame"] = frame_idx
-                        state["occluded_frames"] = state.get("occluded_frames", 0) + 1
-                        self.occlusion_state[key] = state
-                    else:
-                        key = f"guardrail::{int(bbox[0])}_{int(bbox[1])}_{int(bbox[2])}_{int(bbox[3])}"
-                        if key in self.occlusion_state:
-                            self.occlusion_state[key]["occluded_frames"] = 0
-                            self.occlusion_state[key]["last_seen_frame"] = frame_idx
+            id_key = make_id_key(label_norm, bbox)
 
-                # potholes
-                if "pothole" in lower:
-                    det["root_cause"] = self.rca.determine_cause("pothole", {}, gis_profile)
-                    frame_data["potholes"].append(det)
-                    self.pci_stats["potholes"] += 1
+            det = {
+                "label": label_norm,
+                "raw_label": raw_label,
+                "confidence": conf,
+                "bbox": bbox,
+                "id_key": id_key,
+                "occluded": False,
+                "source_model": item["source"]
+            }
 
-                # cracks
-                elif "crack" in lower:
-                    width_px = self._measure_crack_width_px(img, bbox)
-                    width_cm = width_px * self.pixel_to_cm_scale
-                    det["width_px"] = width_px
-                    det["width_cm"] = width_cm
-                    metrics = {"crack_width_cm": width_cm}
-                    det["root_cause"] = self.rca.determine_cause("crack", metrics, gis_profile)
-                    frame_data["cracks"].append(det)
-                    self.pci_stats["crack_len_px"] += width_px
+            lower = label_norm
 
-                # speed breakers
-                elif "speed" in lower and "breaker" in lower:
-                    frame_data["furniture"].append(det)
-
-                # signs
-                elif "sign" in lower:
-                    det["root_cause"] = self.rca.determine_cause("damaged_sign", {}, gis_profile)
-                    frame_data["road_signs"].append(det)
-
-                # traffic lights
-                elif "trafficlight" in lower or "signal" in lower:
-                    frame_data["traffic_lights"].append(det)
-
-                # street lights
-                elif "streetlight" in lower:
-                    frame_data["furniture"].append(det)
-
-                # guardrails
-                elif "guardrail" in lower:
-                    det["root_cause"] = self.rca.determine_cause("broken_guardrail", {}, gis_profile)
-                    frame_data["furniture"].append(det)
-
+            # Guardrail occlusion: check vegetation mask inside bbox
+            if "guardrail" in lower or "guard_rail" in lower:
+                occluded, veg_frac = self._is_guardrail_occluded_by_vegetation(img, bbox)
+                if occluded:
+                    det["occluded"] = True
+                    det["occlusion_vegetation_fraction"] = float(veg_frac)
+                    key = f"guardrail::{int(bbox[0])}_{int(bbox[1])}_{int(bbox[2])}_{int(bbox[3])}"
+                    state = self.occlusion_state.get(key, {"occluded_frames": 0, "last_seen_frame": frame_idx})
+                    state["last_seen_frame"] = frame_idx
+                    state["occluded_frames"] = state.get("occluded_frames", 0) + 1
+                    self.occlusion_state[key] = state
                 else:
-                    frame_data["furniture"].append(det)
+                    key = f"guardrail::{int(bbox[0])}_{int(bbox[1])}_{int(bbox[2])}_{int(bbox[3])}"
+                    if key in self.occlusion_state:
+                        self.occlusion_state[key]["occluded_frames"] = 0
+                        self.occlusion_state[key]["last_seen_frame"] = frame_idx
+
+            # Potholes
+            if "pothole" in lower:
+                det["root_cause"] = self.rca.determine_cause("pothole", {}, gis_profile)
+                frame_data["potholes"].append(det)
+                self.pci_stats["potholes"] += 1
+
+            # Cracks
+            elif "crack" in lower:
+                width_px = self._measure_crack_width_px(img, bbox)
+                width_cm = width_px * self.pixel_to_cm_scale
+                det["width_px"] = width_px
+                det["width_cm"] = width_cm
+                metrics = {"crack_width_cm": width_cm}
+                det["root_cause"] = self.rca.determine_cause("crack", metrics, gis_profile)
+                frame_data["cracks"].append(det)
+                self.pci_stats["crack_len_px"] += width_px
+
+            # Speed breakers / raised-type
+            elif "speed" in lower and "breaker" in lower:
+                frame_data["furniture"].append(det)
+
+            # Signs
+            elif "sign" in lower:
+                det["root_cause"] = self.rca.determine_cause("damaged_sign", {}, gis_profile)
+                frame_data["road_signs"].append(det)
+
+            # Traffic lights / signals
+            elif "trafficlight" in lower or "signal" in lower:
+                frame_data["traffic_lights"].append(det)
+
+            # Street lights and furniture
+            elif "streetlight" in lower or "light" in lower:
+                frame_data["furniture"].append(det)
+
+            # Guardrails
+            elif "guardrail" in lower:
+                det["root_cause"] = self.rca.determine_cause("broken_guardrail", {}, gis_profile)
+                frame_data["furniture"].append(det)
+            
+            # Vehicles / Pedestrians (Base model stuff)
+            elif "vehicle" in lower or "pedestrian" in lower:
+                frame_data["furniture"].append(det) # Categorize as furniture for now to track presence
+
+            else:
+                # fallback to furniture
+                frame_data["furniture"].append(det)
 
         return frame_data
+
 
     # ----------------- PCI calculation -----------------
     def _calculate_pci_score(self, gis_profile=None):
@@ -827,92 +948,262 @@ class EnhancedRoadAuditSystem:
     def _event_key_from_change(self, event):
         return f"{event['element']}::{event.get('type','')}".lower()
 
+
     def _should_suppress_event(self, event_key, current_frame):
-        """
-        Improved suppression:
-         - If same key was seen within cooldown frames -> suppress
-         - Update last_frame and suppressed_until appropriately
-         - Keep recent_events small
-        """
-        cooldown = int(self.config.get("change_cooldown_frames", 3))
+        cooldown = int(self.event_cooldown)
+
         for ev in self.recent_events:
             if ev["key"] == event_key:
-                # If event occurred recently (within cooldown) -> suppress
-                if (current_frame - ev.get("last_frame", -9999)) <= cooldown:
-                    # keep last_frame unchanged (still last seen)
+                if (current_frame - ev.get("last_frame", -99999)) <= cooldown:
                     return True
-                # otherwise update last_frame and allow event
                 ev["last_frame"] = current_frame
                 return False
 
-        # new event -> record and allow
+        # new event
         self.recent_events.append({"key": event_key, "last_frame": current_frame})
-        # trim
         if len(self.recent_events) > 2000:
             self.recent_events = self.recent_events[-1000:]
         return False
 
 
+    def _best_iou_match(self, base_list, pres_list, iou_thresh=0.05):
+        missing = []
+
+        for b in base_list:
+            b_box = b["bbox"]
+            found = False
+            for p in pres_list:
+                if self._iou(b_box, p["bbox"]) > iou_thresh:
+                    found = True
+                    break
+
+            if not found:
+                missing.append(b)
+
+        return missing
+
+
+
     # ----------------- comparison (with occlusion awareness) -----------------
     def _compare_frame_by_frame(self, base_results, present_results, fps):
+
+        def iou_bbox(b1, b2):
+            # b = [x1,y1,x2,y2]
+            x1 = max(b1[0], b2[0])
+            y1 = max(b1[1], b2[1])
+            x2 = min(b1[2], b2[2])
+            y2 = min(b1[3], b2[3])
+            inter_w = max(0.0, x2 - x1)
+            inter_h = max(0.0, y2 - y1)
+            inter = inter_w * inter_h
+            a1 = max(0.0, (b1[2] - b1[0])) * max(0.0, (b1[3] - b1[1]))
+            a2 = max(0.0, (b2[2] - b2[0])) * max(0.0, (b2[3] - b2[1]))
+            union = a1 + a2 - inter
+            if union <= 0:
+                return 0.0
+            return inter / union
+
+        # ensure cooldown is higher as requested by user
+        self.event_cooldown = int(self.config.get("change_cooldown_frames", 3))
+        # increase it explicitly (user asked to increase). We'll set minimum 8.
+        if self.event_cooldown < 8:
+            self.event_cooldown = 8
+
         changes = []
         min_len = min(len(base_results), len(present_results))
+
+        # IoU threshold for a match
+        IOU_THRESH = 0.35
+
         for i in range(min_len):
             base = base_results[i]
             pres = present_results[i]
             frame_log = []
-            # pothole increase
-            if len(pres["potholes"]) > len(base["potholes"]):
-                event = {"element": "Pothole", "type": "New pothole(s) observed", "severity": "high"}
-                key = self._event_key_from_change(event)
-                if self._should_suppress_event(key, i):
-                    self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
-                else:
-                    frame_log.append(event)
-            # crack increase
-            if len(pres["cracks"]) > len(base["cracks"]):
-                event = {"element": "Cracks", "type": "New or widened cracks observed", "severity": "medium"}
-                key = self._event_key_from_change(event)
-                if self._should_suppress_event(key, i):
-                    self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
-                else:
-                    frame_log.append(event)
-            # marking wear
-            if pres["markings"]["marking_wear_pct"] > base["markings"]["marking_wear_pct"] + 20:
-                event = {"element": "Markings", "type": "Additional fading or loss of markings", "severity": "medium"}
-                key = self._event_key_from_change(event)
-                if self._should_suppress_event(key, i):
-                    self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
-                else:
-                    frame_log.append(event)
-            # signs missing
-            if len(pres["road_signs"]) < len(base["road_signs"]):
-                event = {"element": "Road Signs", "type": "Possible missing or damaged sign(s)", "severity": "high"}
-                key = self._event_key_from_change(event)
-                if self._should_suppress_event(key, i):
-                    self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
-                else:
-                    frame_log.append(event)
-            # roadside furniture (guardrail occlusion aware)
-            if len(pres["furniture"]) < len(base["furniture"]):
-                occlusion_suppressed = False
-                for b_det in base["furniture"]:
-                    if "guardrail" in b_det.get("label", "").lower():
-                        key_coords = f"guardrail::{int(b_det['bbox'][0])}_{int(b_det['bbox'][1])}_{int(b_det['bbox'][2])}_{int(b_det['bbox'][3])}"
-                        state = self.occlusion_state.get(key_coords)
-                        if state and state.get("occluded_frames", 0) >= self.config["occlusion_persistence_frames"]:
-                            occlusion_suppressed = True
-                            self.suppressed_events.append({"frame": i, "event": {"element": "Roadside Furniture", "type": "Possible missing guardrail (occluded by vegetation)"}, "reason": "occlusion"})
-                            break
-                if not occlusion_suppressed:
-                    event = {"element": "Roadside Furniture", "type": "Missing or damaged roadside asset(s)", "severity": "high"}
+
+            # Helper: perform matching for a given class list name
+            def compare_class_list(key_name, human_name):
+                """
+                key_name: "potholes", "cracks", "road_signs", "traffic_lights", "furniture"
+                human_name: pretty string for messages
+                """
+                base_list = base.get(key_name, []) or []
+                pres_list = pres.get(key_name, []) or []
+
+                matched_pres = set()
+                matched_base = set()
+
+                # build index
+                for bi, bdet in enumerate(base_list):
+                    bbbox = bdet.get("bbox", [0, 0, 0, 0])
+                    blabel = bdet.get("label", "")
+                    best_j = -1
+                    best_iou = 0.0
+                    for pj, pdet in enumerate(pres_list):
+                        if pj in matched_pres:
+                            continue
+                        pbbox = pdet.get("bbox", [0, 0, 0, 0])
+                        piou = iou_bbox(bbbox, pbbox)
+                        # only compare same label family where possible
+                        if blabel and pdet.get("label", "") and blabel.split("::")[0] != pdet.get("label","").split("::")[0]:
+                            # allow comparison even if labels slightly differ (e.g., guardrail vs guard_rail)
+                            pass
+                        if piou > best_iou:
+                            best_iou = piou
+                            best_j = pj
+                    if best_j >= 0 and best_iou >= IOU_THRESH:
+                        matched_base.add(bi)
+                        matched_pres.add(best_j)
+                        # check severity changes (for cracks: width increase; for potholes: maybe size change)
+                        if key_name == "cracks":
+                            # compare width if available
+                            base_w = float(bdet.get("width_cm", bdet.get("width_px", 0) or 0) or 0)
+                            pres_w = float(pres_list[best_j].get("width_cm", pres_list[best_j].get("width_px", 0) or 0) or 0)
+                            if pres_w > base_w + 2.0:  # widened by >2cm (heuristic)
+                                event = {"element": human_name, "type": "Crack widening observed", "severity": "medium", "details": {"base_width_cm": base_w, "present_width_cm": pres_w}}
+                                key = self._event_key_from_change(event)
+                                # suppression via cooldown
+                                if self._should_suppress_event(key, i):
+                                    self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                                else:
+                                    frame_log.append(event)
+                        # pothole size growth
+                        if key_name == "potholes":
+                            # If coords available we can compare bbox area growth
+                            try:
+                                b_area = (bbbox[2]-bbbox[0])*(bbbox[3]-bbbox[1])
+                                p_area = (pres_list[best_j]["bbox"][2]-pres_list[best_j]["bbox"][0])*(pres_list[best_j]["bbox"][3]-pres_list[best_j]["bbox"][1])
+                                if p_area > b_area * 1.5:
+                                    event = {"element": human_name, "type": "Pothole growth observed", "severity": "high", "details": {"base_area_px": b_area, "present_area_px": p_area}}
+                                    key = self._event_key_from_change(event)
+                                    if self._should_suppress_event(key, i):
+                                        self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                                    else:
+                                        frame_log.append(event)
+                            except Exception:
+                                pass
+
+                # anything in pres_list not matched => new detections
+                for pj, pdet in enumerate(pres_list):
+                    if pj in matched_pres:
+                        continue
+                    # new object
+                    event = {"element": human_name, "type": f"New {human_name} detected", "severity": "medium", "details": {"label": pdet.get("label"), "confidence": pdet.get("confidence")}}
                     key = self._event_key_from_change(event)
                     if self._should_suppress_event(key, i):
                         self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
                     else:
                         frame_log.append(event)
+
+                # anything in base_list not matched => missing in present (possible removal/damage)
+                for bi, bdet in enumerate(base_list):
+                    if bi in matched_base:
+                        continue
+                    # check occlusion for guardrails & signs: if occluded in present, suppress as occlusion
+                    label = (bdet.get("label") or "").lower()
+                    bbox = bdet.get("bbox", [0, 0, 0, 0])
+                    occlusion_key = f"guardrail::{int(bbox[0])}_{int(bbox[1])}_{int(bbox[2])}_{int(bbox[3])}"
+                    occluded_reason = False
+
+                    # guardrail occlusion check
+                    if "guardrail" in label:
+                        state = self.occlusion_state.get(occlusion_key)
+                        if state and state.get("occluded_frames", 0) >= self.config.get("occlusion_persistence_frames", 5):
+                            occluded_reason = True
+                            self.suppressed_events.append({"frame": i, "event": {"element": human_name, "type": "Possible missing guardrail (occluded by vegetation)"}, "reason": "occlusion"})
+
+                    # sign occlusion: if we have occlusion_state for guardrail or if present frame marking occlusion percentage high
+                    if "sign" in label or "board" in label:
+                        # look for occlusion flags in present frame detections near same bbox (approx)
+                        # If any furniture detection at same approximate location has occluded=True, treat as occlusion
+                        for pdet in pres_list:
+                            if pdet.get("occluded", False):
+                                if iou_bbox(bbox, pdet.get("bbox", [0,0,0,0])) > 0.15:
+                                    occluded_reason = True
+                                    self.suppressed_events.append({"frame": i, "event": {"element": human_name, "type": "Missing sign suppressed (likely occluded)"}, "reason": "occlusion"})
+                                    break
+
+                    if occluded_reason:
+                        continue
+
+                    # if not occluded -> report missing/damaged
+                    event = {"element": human_name, "type": f"Missing or damaged {human_name}", "severity": "high", "details": {"label": bdet.get("label"), "confidence": bdet.get("confidence")}}
+                    key = self._event_key_from_change(event)
+                    if self._should_suppress_event(key, i):
+                        self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                    else:
+                        frame_log.append(event)
+
+            # Compare structural classes
+            compare_class_list("potholes", "Pothole")
+            compare_class_list("cracks", "Cracks")
+            compare_class_list("road_signs", "Road Signs")
+            compare_class_list("traffic_lights", "Traffic Light")
+            compare_class_list("furniture", "Roadside Furniture")
+
+            # ---------------------------
+            # Markings comparison (IoU not available here; use presence/area heuristics)
+            # ---------------------------
+            base_marks = base.get("marking_detections", []) or []
+            pres_marks = pres.get("marking_detections", []) or []
+
+            # build simple label->area mapping
+            def build_area_map(marks):
+                m = {}
+                for det in marks:
+                    lbl = str(det.get("label","")).lower()
+                    area = int(det.get("area_px", 0) or 0)
+                    # accumulate area if multiple masks of same class
+                    m[lbl] = m.get(lbl, 0) + area
+                return m
+
+            base_area_map = build_area_map(base_marks)
+            pres_area_map = build_area_map(pres_marks)
+
+            # consider common marking types
+            marking_types = set(list(base_area_map.keys()) + list(pres_area_map.keys()) + ["lane", "center", "stop", "zebra", "edge"])
+            for mtype in marking_types:
+                base_area = base_area_map.get(mtype, 0)
+                pres_area = pres_area_map.get(mtype, 0)
+                # missing entirely
+                if base_area > 0 and pres_area == 0:
+                    event = {"element": "Markings", "type": f"{mtype} missing or not detected", "severity": "high", "details": {"base_area_px": base_area, "present_area_px": pres_area}}
+                    key = self._event_key_from_change(event)
+                    if self._should_suppress_event(key, i):
+                        self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                    else:
+                        frame_log.append(event)
+                else:
+                    # large area drop ( >60% )
+                    if base_area > 0 and pres_area > 0 and pres_area < 0.4 * base_area:
+                        event = {"element": "Markings", "type": f"{mtype} visibility decreased significantly", "severity": "medium", "details": {"base_area_px": base_area, "present_area_px": pres_area}}
+                        key = self._event_key_from_change(event)
+                        if self._should_suppress_event(key, i):
+                            self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                        else:
+                            frame_log.append(event)
+
+            # Also use marking_wear_pct heuristic (existing behavior)
+            try:
+                if pres.get("markings", {}).get("marking_wear_pct", 0.0) > base.get("markings", {}).get("marking_wear_pct", 0.0) + 20:
+                    event = {"element": "Markings", "type": "Additional fading or loss of markings", "severity": "medium"}
+                    key = self._event_key_from_change(event)
+                    if self._should_suppress_event(key, i):
+                        self.suppressed_events.append({"frame": i, "event": event, "reason": "cooldown"})
+                    else:
+                        frame_log.append(event)
+            except Exception:
+                pass
+
+            # Append changes for this frame if any
             if frame_log:
-                changes.append({"frame_id": i, "timestamp_seconds": i / fps if fps > 0 else 0.0, "changes": frame_log, "base_frame": base.get("frame"), "present_frame": pres.get("frame")})
+                changes.append({
+                    "frame_id": i,
+                    "timestamp_seconds": i / fps if fps > 0 else 0.0,
+                    "changes": frame_log,
+                    "base_frame": base.get("frame"),
+                    "present_frame": pres.get("frame"),
+                })
+
         return changes
 
     # ----------------- save comparison images -----------------
@@ -995,12 +1286,22 @@ class EnhancedRoadAuditSystem:
             if img is None:
                 self._log(f"[BASE][WARN] Skipping unreadable frame: {f}")
                 continue
+            
+            # --- DUAL MODEL INFERENCE ---
+            custom_res = None
+            base_res = None
             try:
+                # Run Custom
                 custom_res = self.custom_model(img, verbose=False, device=self.device)[0]
+                # Run Base (if available)
+                if self.base_model:
+                    base_res = self.base_model(img, verbose=False, device=self.device)[0]
             except Exception as e:
-                self._log(f"[BASE][ERROR] Custom model inference failed on {f}: {e}")
+                self._log(f"[BASE][ERROR] Model inference failed on {f}: {e}")
                 continue
-            frame_data = self._collate_frame_results(f, custom_res, None, self.global_gis_profile, idx)
+            
+            # Collate (merge) results
+            frame_data = self._collate_frame_results(f, custom_res, base_res, self.global_gis_profile, idx)
             if frame_data:
                 base_results.append(frame_data)
 
@@ -1018,12 +1319,22 @@ class EnhancedRoadAuditSystem:
             if img is None:
                 self._log(f"[PRESENT][WARN] Skipping unreadable frame: {f}")
                 continue
+            
+            # --- DUAL MODEL INFERENCE ---
+            custom_res = None
+            base_res = None
             try:
+                # Run Custom
                 custom_res = self.custom_model(img, verbose=False, device=self.device)[0]
+                # Run Base (if available)
+                if self.base_model:
+                    base_res = self.base_model(img, verbose=False, device=self.device)[0]
             except Exception as e:
-                self._log(f"[PRESENT][ERROR] Custom model inference failed on {f}: {e}")
+                self._log(f"[PRESENT][ERROR] Model inference failed on {f}: {e}")
                 continue
-            frame_data = self._collate_frame_results(f, custom_res, None, self.global_gis_profile, idx)
+            
+            # Collate (merge) results
+            frame_data = self._collate_frame_results(f, custom_res, base_res, self.global_gis_profile, idx)
             if frame_data:
                 present_results.append(frame_data)
 
