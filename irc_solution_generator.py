@@ -1,7 +1,7 @@
 """
-irc_solution_generator_enhanced.py — COMPLETE (all 8 defects + frame-level analysis)
+irc_solution_generator.py — COMPLETE ENHANCED VERSION (all 8 defects)
 
-Generates comprehensive IRC-based recommendations from audit_output.json.
+Generates IRC-based recommendations from audit_output.json.
 NOW EXTRACTS ALL DEFECT TYPES:
   1. Potholes
   2. Cracks
@@ -13,10 +13,10 @@ NOW EXTRACTS ALL DEFECT TYPES:
   8. Guardrails (occluded/damaged)
 
 Key improvements:
- - Counts defects from both aggregate_comparison AND frame-level detections
- - Analyzes frame_level_changes for severity & change patterns
- - IRC references for all 8 defect types
- - Defensive JSON parsing with safe fallbacks
+- Counts defects from both aggregate_comparison AND frame-level detections
+- Analyzes frame_level_changes for severity & change patterns
+- IRC references for all 8 defect types
+- Defensive JSON parsing with safe fallbacks
 """
 
 import json
@@ -366,10 +366,17 @@ class EnhancedIRCSolutionGenerator:
     # ---------------------------
     def rule_speed_breakers(self):
         # Count from frame data
-        counts = self._count_defect_in_frames("speed_breakers")
+        counts = self._count_defect_in_frames("furniture")  # Speed breakers often in furniture
         base = counts["base"]
         present = counts["present"]
         delta = counts["delta"]
+
+        # Try to get specific speed breaker count from aggregate if available
+        agg = self._safe_get(["aggregate_comparison", "speed_breakers"], {})
+        if agg:
+            base = int(agg.get("base", 0) or 0)
+            present = int(agg.get("present", 0) or 0)
+            delta = int(agg.get("delta", present - base) or 0)
 
         if present <= 0 and delta == 0:
             return
@@ -522,7 +529,7 @@ class EnhancedIRCSolutionGenerator:
         }
 
         # Write to results
-        out_path = Path("results") / "irc_output_enhanced.json"
+        out_path = Path("results") / "irc_output.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(out_path, "w", encoding="utf-8") as f:
@@ -536,7 +543,7 @@ class EnhancedIRCSolutionGenerator:
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python irc_solution_generator_enhanced.py <audit_json_path>")
+        print("Usage: python irc_solution_generator.py <audit_json_path>")
         sys.exit(1)
 
     gen = EnhancedIRCSolutionGenerator(sys.argv[1])
