@@ -269,9 +269,9 @@ st.sidebar.info(f"Device: **{get_device().upper()}**")
 # Video upload
 col1, col2 = st.columns(2)
 with col1:
-    base_video = st.file_uploader("📹 Upload Base Video", type=["mp4", "mov", "avi", "mkv"])
+    base_video = st.file_uploader("Upload Base Video", type=["mp4", "mov", "avi", "mkv"])
 with col2:
-    present_video = st.file_uploader("📹 Upload Present Video", type=["mp4", "mov", "avi", "mkv"])
+    present_video = st.file_uploader("Upload Present Video", type=["mp4", "mov", "avi", "mkv"])
 
 run_btn = st.button("Run Complete Audit", type="primary", disabled=not (base_video and present_video))
 
@@ -513,7 +513,7 @@ with tabs[1]:
 
 # Tab 3: IRC Recommendations
 with tabs[2]:
-    st.header("🔧 IRC Maintenance Recommendations (All 8 Defects)")
+    st.header("IRC Maintenance Recommendations (All 8 Defects)")
     
     if not st.session_state.audit_completed or not irc_report:
         st.info("Run audit first.")
@@ -543,7 +543,7 @@ with tabs[2]:
 
 # Tab 4: Downloads
 with tabs[3]:
-    st.header("📥 Downloads")
+    st.header("Downloads")
     
     col1, col2 = st.columns(2)
     
